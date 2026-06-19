@@ -541,9 +541,10 @@ async def ensure_reality_keys():
         text = out.decode()
         priv = pub = ""
         for line in text.splitlines():
-            if line.lower().startswith("private key:"):
+            low = line.lower().replace(" ", "")
+            if low.startswith("privatekey:"):
                 priv = line.split(":", 1)[1].strip()
-            elif line.lower().startswith("public key:"):
+            elif low.startswith("publickey:") or "(publickey)" in low.split(":")[0]:
                 pub = line.split(":", 1)[1].strip()
         if priv and pub:
             REALITY["private_key"] = priv

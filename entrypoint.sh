@@ -2,7 +2,11 @@
 set -e
 
 # ───── متغیرها ─────
-export NGINX_PORT="${PORT:-8080}"
+# توجه: عمداً از $PORT ریلوی استفاده نمی‌کنیم، چون با اضافه‌شدن TCP Proxy های
+# دیگه (مثل Reality روی ۸۴۴۳)، ریلوی مقدار $PORT رو عوض می‌کنه و nginx رو از
+# پورت HTTP اصلی می‌ندازه. به‌جاش یه متغیر ثابت و مجزا (HTTP_PORT) داریم که
+# همیشه ۸۰۸۰ هست، مگر اینکه خودت دستی override کنی.
+export NGINX_PORT="${HTTP_PORT:-8080}"
 export XRAY_BIN="${XRAY_BIN:-/usr/local/bin/xray}"
 export XRAY_LOCATION_ASSET="${XRAY_LOCATION_ASSET:-/usr/local/share/xray}"
 DATA_DIR="${DATA_DIR:-/data}"
