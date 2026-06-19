@@ -37,6 +37,14 @@ def _detect_host() -> str:
     if h: return h
     return "localhost"
 
+def _detect_reality_public_port() -> int:
+    """پورت خارجی TCP Proxy که کلاینت باید بهش وصل بشه.
+    در Railway با TCP Proxy یه پورت رندوم میده — اون رو توی REALITY_PUBLIC_PORT بذار.
+    اگه ست نشده، از همون پورت داخلی استفاده میکنه."""
+    p = os.environ.get("REALITY_PUBLIC_PORT")
+    if p: return int(p)
+    return CONFIG["xray_reality_port"]
+
 def _detect_reality_host() -> str:
     """دامنه TCP Proxy مخصوص Reality را برمی‌گرداند.
     در Railway باید REALITY_TCP_DOMAIN را دستی ست کنی (مثلاً xyz.railway.app:8443 بدون پورت).
@@ -706,14 +714,14 @@ def get_link_connection_info(uid: str, link: dict, host: str, index: int = 0) ->
             "path":     "/xray-xhttp",
         }
     elif proto == "vless-reality":
-        port = CONFIG["xray_reality_port"]
         reality_host = _detect_reality_host()
+        public_port  = _detect_reality_public_port()
         return {
-            "link":     generate_vless_reality_link(uid, reality_host, port, link.get("label", "tryak")),
+            "link":     generate_vless_reality_link(uid, reality_host, public_port, link.get("label", "tryak")),
             "protocol": "VLESS + Reality",
-            "server":   reality_host, "port": port,
+            "server":   reality_host, "port": public_port,
             "note":     "این پروتکل مستقیم و بدون Nginx کار می‌کنه؛ روی Railway باید پورت "
-                        f"{port} رو جدا به‌صورت TCP Proxy اکسپوز کرده باشی.",
+                        f"{public_port} رو جدا به‌صورت TCP Proxy اکسپوز کرده باشی.",
         }
     return {}
 
