@@ -55,13 +55,23 @@ CONFIG = {
     "port":   8000,
     "secret": _secret_env or secrets.token_urlsafe(32),
     "host":   _detect_host(),
-    # پورت‌های داخلی Xray (روی localhost)
+    # پورت‌های داخلی Xray (روی localhost) — پشت Nginx
     "xray_vless_port":    10000,
     "xray_trojan_port":   10001,
     "xray_ss_port":       10002,
     "xray_http_port":     10003,
+    "xray_xhttp_port":    10004,
     "xray_api_port":      10085,
+    # پورت Reality — این یکی باید مستقیم (نه پشت Nginx) به بیرون اکسپوز بشه
+    # چون Reality خودش handshake واقعی TLS رو هندل می‌کنه. در Railway باید
+    # یه TCP Proxy جدا روی همین پورت بسازی (Settings → Networking → TCP Proxy).
+    "xray_reality_port":  int(os.environ.get("REALITY_PORT", "8443")),
 }
+
+# دامنه‌ای که Reality وانمود می‌کنه بهش وصل شده (camouflage) — باید یه سایت واقعی
+# با TLS1.3 و HTTP/2 باشه. قابل تنظیم با env REALITY_DEST / REALITY_SNI.
+REALITY_DEST = os.environ.get("REALITY_DEST", "www.microsoft.com:443")
+REALITY_SNI  = os.environ.get("REALITY_SNI", REALITY_DEST.split(":")[0])
 
 # ───────── Persistence ─────────
 _DATA_DIR = Path("/data") if Path("/data").exists() else Path("/tmp")
@@ -87,6 +97,9 @@ hourly_traffic: dict = defaultdict(int)
 # لینک‌ها  uid -> {label, protocol, limit_bytes, used_bytes, created_at, expires_at, active, password(trojan/ss), ss_method}
 LINKS: dict = {}
 LINKS_LOCK = asyncio.Lock()
+
+# کلیدهای Reality (یک‌بار ساخته و persist می‌شن تا با ری‌استارت لینک‌های قبلی خراب نشن)
+REALITY: dict = {"private_key": "", "public_key": "", "short_id": ""}
 
 BLOCKED_IPS: set = set()
 
@@ -208,7 +221,7 @@ def flag(code: str) -> str:
     return chr(0x1F1E6 + ord(code[0].upper()) - 65) + chr(0x1F1E6 + ord(code[1].upper()) - 65)
 
 # ───────── Xray Config Generator ─────────
-SUPPORTED_PROTOCOLS = ["vless", "trojan", "shadowsocks", "http"]
+SUPPORTED_PROTOCOLS = ["vless", "trojan", "shadowsocks", "http", "vless-xhttp", "vless-reality"]
 
 def build_xray_config() -> dict:
     """کانفیگ کامل Xray را بر اساس LINKS فعلی می‌سازد."""
@@ -260,7 +273,63 @@ def build_xray_config() -> dict:
             "sniffing": {"enabled": True, "destOverride": ["http", "tls"]}
         })
 
-    # ── Shadowsocks ──
+    # ── VLESS + XHTTP (پشت Nginx، مسیر /xray-xhttp) ──
+    xhttp_clients = []
+    for uid, link in LINKS.items():
+        if link.get("protocol") == "vless-xhttp" and link.get("active"):
+            xhttp_clients.append({"id": uid, "email": uid})
+
+    if xhttp_clients:
+        inbounds.append({
+            "tag": "vless-xhttp-in",
+            "listen": "127.0.0.1",
+            "port": CONFIG["xray_xhttp_port"],
+            "protocol": "vless",
+            "settings": {
+                "clients": xhttp_clients,
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "xhttp",
+                "xhttpSettings": {"path": "/xray-xhttp", "mode": "auto"}
+            },
+            "sniffing": {"enabled": True, "destOverride": ["http", "tls"]}
+        })
+
+    # ── VLESS + Reality (مستقیم، بدون Nginx — به یه TCP Proxy جدا روی Railway نیاز داره) ──
+    reality_clients = []
+    for uid, link in LINKS.items():
+        if link.get("protocol") == "vless-reality" and link.get("active"):
+            reality_clients.append({"id": uid, "email": uid, "flow": "xtls-rprx-vision"})
+
+    if reality_clients and REALITY.get("private_key"):
+        inbounds.append({
+            "tag": "vless-reality-in",
+            "listen": "0.0.0.0",
+            "port": CONFIG["xray_reality_port"],
+            "protocol": "vless",
+            "settings": {
+                "clients": reality_clients,
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "security": "reality",
+                "realitySettings": {
+                    "show": False,
+                    "dest": REALITY_DEST,
+                    "xver": 0,
+                    "serverNames": [REALITY_SNI],
+                    "privateKey": REALITY["private_key"],
+                    "shortIds": [REALITY.get("short_id", "")],
+                }
+            },
+            "sniffing": {"enabled": True, "destOverride": ["http", "tls"]}
+        })
+    elif reality_clients:
+        logger.warning("⚠️ کلاینت Reality وجود دارد ولی کلید Reality ساخته نشده؛ این inbound نادیده گرفته شد.")
+
+
     # هر لینک SS یه پورت مجزا می‌خواد — از پورت پایه + index استفاده می‌کنیم
     ss_links = [(uid, link) for uid, link in LINKS.items()
                 if link.get("protocol") == "shadowsocks" and link.get("active")]
@@ -435,6 +504,7 @@ async def save_data():
             data = {
                 "links":       {k: dict(v) for k, v in LINKS.items()},
                 "blocked_ips": list(BLOCKED_IPS),
+                "reality":     dict(REALITY),
             }
         tmp = DATA_FILE.with_suffix(".tmp")
         await asyncio.to_thread(tmp.write_text, json.dumps(data, ensure_ascii=False, indent=2))
@@ -451,9 +521,41 @@ def load_data():
             LINKS.update(data.get("links", {}))
             BLOCKED_IPS.clear()
             BLOCKED_IPS.update(data.get("blocked_ips", []))
+            saved_reality = data.get("reality") or {}
+            if saved_reality.get("private_key"):
+                REALITY.update(saved_reality)
             logger.info(f"✅ Loaded {len(LINKS)} links")
     except Exception as e:
         logger.error(f"Load error: {e}")
+
+async def ensure_reality_keys():
+    """اگه کلید Reality قبلاً ساخته نشده، یه‌بار با باینری xray می‌سازدش و persist می‌کنه."""
+    if REALITY.get("private_key") and REALITY.get("public_key"):
+        return
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            str(XRAY_BIN), "x25519",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        text = out.decode()
+        priv = pub = ""
+        for line in text.splitlines():
+            if line.lower().startswith("private key:"):
+                priv = line.split(":", 1)[1].strip()
+            elif line.lower().startswith("public key:"):
+                pub = line.split(":", 1)[1].strip()
+        if priv and pub:
+            REALITY["private_key"] = priv
+            REALITY["public_key"]  = pub
+            REALITY["short_id"]    = secrets.token_hex(4)
+            await save_data()
+            logger.info("✅ کلیدهای Reality ساخته شد.")
+        else:
+            logger.warning(f"⚠️ خروجی xray x25519 نامعتبر بود: {text!r}")
+    except Exception as e:
+        logger.warning(f"⚠️ ساخت کلید Reality شکست خورد: {e}")
+
 
 # ───────── Background loops ─────────
 async def keepalive_loop():
@@ -537,6 +639,24 @@ def generate_ss_link(method: str, password: str, host: str, port: int, label: st
     userinfo = b64.urlsafe_b64encode(f"{method}:{password}".encode()).decode().rstrip("=")
     return f"ss://{userinfo}@{host}:{port}#{quote(label)}"
 
+def generate_vless_xhttp_link(uid: str, host: str, label: str = "tryak") -> str:
+    path = "/xray-xhttp"
+    params = {
+        "encryption": "none", "security": "tls", "type": "xhttp", "mode": "auto",
+        "host": host, "path": path, "sni": host, "fp": "chrome", "alpn": "h2,http/1.1",
+    }
+    q = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
+    return f"vless://{uid}@{host}:443?{q}#{quote(label)}"
+
+def generate_vless_reality_link(uid: str, host: str, port: int, label: str = "tryak") -> str:
+    params = {
+        "encryption": "none", "security": "reality", "type": "tcp", "flow": "xtls-rprx-vision",
+        "sni": REALITY_SNI, "fp": "chrome",
+        "pbk": REALITY.get("public_key", ""), "sid": REALITY.get("short_id", ""),
+    }
+    q = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
+    return f"vless://{uid}@{host}:{port}?{q}#{quote(label)}"
+
 def get_link_connection_info(uid: str, link: dict, host: str, index: int = 0) -> dict:
     proto = link.get("protocol", "vless")
     if proto == "vless":
@@ -568,6 +688,22 @@ def get_link_connection_info(uid: str, link: dict, host: str, index: int = 0) ->
             "server":   host, "port": port,
             "username": uid[:8], "password": link.get("password", uid[:16]),
         }
+    elif proto == "vless-xhttp":
+        return {
+            "link":     generate_vless_xhttp_link(uid, host, link.get("label", "tryak")),
+            "protocol": "VLESS + XHTTP + TLS",
+            "server":   host, "port": 443,
+            "path":     "/xray-xhttp",
+        }
+    elif proto == "vless-reality":
+        port = CONFIG["xray_reality_port"]
+        return {
+            "link":     generate_vless_reality_link(uid, host, port, link.get("label", "tryak")),
+            "protocol": "VLESS + Reality",
+            "server":   host, "port": port,
+            "note":     "این پروتکل مستقیم و بدون Nginx کار می‌کنه؛ روی Railway باید پورت "
+                        f"{port} رو جدا به‌صورت TCP Proxy اکسپوز کرده باشی.",
+        }
     return {}
 
 # ───────── Lifespan ─────────
@@ -579,6 +715,7 @@ async def lifespan(app: FastAPI):
     http_client = httpx.AsyncClient(limits=limits, timeout=timeout, follow_redirects=True)
 
     load_data()
+    await ensure_reality_keys()
     await start_xray()
 
     keepalive_task = asyncio.create_task(keepalive_loop())
@@ -845,6 +982,7 @@ async def subscription_page(uid: str, request: Request):
         days_left = max(0, int((datetime.fromisoformat(exp) - datetime.now()).total_seconds() / 86400))
 
     proto_badge = {"vless": "VLESS · WS · TLS", "trojan": "Trojan · WS · TLS",
+                   "vless-xhttp": "VLESS · XHTTP · TLS", "vless-reality": "VLESS · Reality",
                    "shadowsocks": f"Shadowsocks · {link.get('ss_method','')}", "http": "HTTP Proxy"}.get(proto, proto)
     bar = "#6366f1" if pct < 70 else ("#f0b14a" if pct < 90 else "#f56565")
     status_text = "فعال" if is_active else "غیرفعال"
@@ -1358,6 +1496,8 @@ body{font-family:'Vazirmatn',sans-serif;background:radial-gradient(circle at 15%
         <div class="form-label">پروتکل</div>
         <select class="form-select" id="new-proto" onchange="onProtoChange()" style="width:100%">
           <option value="vless">VLESS + WS + TLS</option>
+          <option value="vless-xhttp">VLESS + XHTTP + TLS</option>
+          <option value="vless-reality">VLESS + Reality</option>
           <option value="trojan">Trojan + WS + TLS</option>
           <option value="shadowsocks">Shadowsocks</option>
           <option value="http">HTTP Proxy</option>
