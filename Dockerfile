@@ -6,24 +6,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # ───── Xray-core ─────
-RUN XRAY_VERSION=$(curl -sf https://api.github.com/repos/XTLS/Xray-core/releases/latest \
-        | grep '"tag_name"' | cut -d'"' -f4) \
-    && echo "Installing Xray $XRAY_VERSION" \
-    && curl -fL "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip" \
+# ورژن پین شده — برای آپدیت فقط این عدد رو عوض کن
+ARG XRAY_VERSION=v25.6.8
+RUN echo "Installing Xray ${XRAY_VERSION}" \
+    && curl -fL --retry 3 --retry-delay 3 \
+        "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip" \
         -o /tmp/xray.zip \
     && unzip -q /tmp/xray.zip -d /tmp/xray \
     && mv /tmp/xray/xray /usr/local/bin/xray \
     && chmod +x /usr/local/bin/xray \
     && rm -rf /tmp/xray /tmp/xray.zip
 
-# ───── GeoIP (با fallback) ─────
-# توجه: geosite.dat حذف شد چون routing rule‌های فعلی فقط از geoip:private/geoip:cn
-# استفاده می‌کنن، نه از geosite — دانلودش فقط حجم و زمان build رو هدر می‌داد.
+# ───── GeoIP (با چند fallback مطمئن) ─────
+# geosite.dat لازم نیست — routing فقط از geoip:private/geoip:cn استفاده می‌کنه
 RUN mkdir -p /usr/local/share/xray \
-    && (curl -fL https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat \
+    && (curl -fL --retry 3 --retry-delay 2 \
+        https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat \
         -o /usr/local/share/xray/geoip.dat 2>/dev/null \
-     || curl -fL https://github.com/v2fly/geoip/releases/latest/download/geoip.dat \
-        -o /usr/local/share/xray/geoip.dat) \
+     || curl -fL --retry 3 --retry-delay 2 \
+        https://github.com/v2fly/geoip/releases/latest/download/geoip.dat \
+        -o /usr/local/share/xray/geoip.dat 2>/dev/null \
+     || echo "⚠️ geoip.dat دانلود نشد — routing مبتنی بر geoip غیرفعال خواهد بود") \
     && apt-get purge -y unzip && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/* /tmp/*
 
@@ -46,7 +49,6 @@ ENV PYTHONUNBUFFERED=1 \
     XRAY_BIN=/usr/local/bin/xray \
     DATA_DIR=/data
 
-# فقط یک پورت — Railway این رو با $PORT می‌ده
 EXPOSE 8080
 
 CMD ["/entrypoint.sh"]
