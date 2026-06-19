@@ -1,0 +1,1650 @@
+import asyncio
+import json
+import os
+import hashlib
+import secrets
+import time
+import subprocess
+import signal
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
+from pathlib import Path
+from urllib.parse import quote
+import uuid as _uuid_mod
+from collections import deque, defaultdict
+
+from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi.responses import Response, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
+import httpx
+import logging
+import psutil
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("tryak-Xray")
+
+# ───────── Platform Detection ─────────
+def _detect_host() -> str:
+    for env in ["RAILWAY_PUBLIC_DOMAIN", "RENDER_EXTERNAL_HOSTNAME", "KOYEB_PUBLIC_DOMAIN"]:
+        h = os.environ.get(env)
+        if h: return h
+    h = os.environ.get("FLY_APP_NAME")
+    if h: return f"{h}.fly.dev"
+    h = os.environ.get("HEROKU_APP_DEFAULT_DOMAIN_NAME")
+    if h: return h
+    h = os.environ.get("PUBLIC_DOMAIN")
+    if h: return h
+    return "localhost"
+
+def _detect_platform() -> str:
+    if os.environ.get("RAILWAY_PUBLIC_DOMAIN") or os.environ.get("RAILWAY_ENVIRONMENT"):
+        return "Railway"
+    if os.environ.get("RENDER_EXTERNAL_HOSTNAME") or os.environ.get("RENDER"):
+        return "Render"
+    if os.environ.get("FLY_APP_NAME"): return "Fly.io"
+    if os.environ.get("KOYEB_PUBLIC_DOMAIN"): return "Koyeb"
+    return "Local"
+
+_secret_env = os.environ.get("SECRET_KEY", "")
+if not _secret_env:
+    logger.warning("⚠️ SECRET_KEY تنظیم نشده! یک مقدار رندوم موقت استفاده می‌شود.")
+
+CONFIG = {
+    # FastAPI همیشه روی 8000 داخلی listen می‌کنه — Nginx روی $PORT گوش می‌ده
+    "port":   8000,
+    "secret": _secret_env or secrets.token_urlsafe(32),
+    "host":   _detect_host(),
+    # پورت‌های داخلی Xray (روی localhost)
+    "xray_vless_port":    10000,
+    "xray_trojan_port":   10001,
+    "xray_ss_port":       10002,
+    "xray_http_port":     10003,
+    "xray_api_port":      10085,
+}
+
+# ───────── Persistence ─────────
+_DATA_DIR = Path("/data") if Path("/data").exists() else Path("/tmp")
+DATA_FILE  = _DATA_DIR / "xray_gateway_data.json"
+XRAY_BIN   = Path(os.environ.get("XRAY_BIN", "/usr/local/bin/xray"))
+
+# ───────── State ─────────
+http_client: httpx.AsyncClient | None = None
+xray_process: subprocess.Popen | None = None
+keepalive_task: asyncio.Task | None  = None
+scheduler_task: asyncio.Task | None  = None
+traffic_task: asyncio.Task | None    = None
+
+stats = {
+    "total_bytes": 0,
+    "total_requests": 0,
+    "total_errors": 0,
+    "start_time": time.time(),
+}
+error_logs: deque = deque(maxlen=50)
+hourly_traffic: dict = defaultdict(int)
+
+# لینک‌ها  uid -> {label, protocol, limit_bytes, used_bytes, created_at, expires_at, active, password(trojan/ss), ss_method}
+LINKS: dict = {}
+LINKS_LOCK = asyncio.Lock()
+
+BLOCKED_IPS: set = set()
+
+# session
+SESSION_COOKIE = "tryak_xray_session"
+SESSION_TTL    = 60 * 60 * 24 * 7
+SESSIONS: dict = {}
+SESSIONS_LOCK  = asyncio.Lock()
+
+# ───────── Auth helpers ─────────
+def hash_password(pw: str) -> str:
+    return hashlib.sha256(f"{pw}{CONFIG['secret']}".encode()).hexdigest()
+
+_admin_pw = os.environ.get("ADMIN_PASSWORD", "").strip()
+if not _admin_pw:
+    _admin_pw = "admin"
+    logger.warning("⚠️ ADMIN_PASSWORD تنظیم نشده! رمز پیش‌فرض 'admin' استفاده می‌شود.")
+
+AUTH = {"password_hash": hash_password(_admin_pw)}
+
+async def create_session() -> str:
+    token = secrets.token_urlsafe(32)
+    async with SESSIONS_LOCK:
+        SESSIONS[token] = time.time() + SESSION_TTL
+    return token
+
+async def is_valid_session(token: str | None) -> bool:
+    if not token: return False
+    async with SESSIONS_LOCK:
+        exp = SESSIONS.get(token)
+        if exp is None: return False
+        if exp < time.time():
+            SESSIONS.pop(token, None)
+            return False
+        return True
+
+async def destroy_session(token: str | None):
+    if token:
+        async with SESSIONS_LOCK:
+            SESSIONS.pop(token, None)
+
+async def require_auth(request: Request):
+    token = request.cookies.get(SESSION_COOKIE)
+    if not await is_valid_session(token):
+        raise HTTPException(status_code=401, detail="unauthorized")
+    return token
+
+# ───────── UUID / helpers ─────────
+def generate_uuid(seed: str | None = None) -> str:
+    if seed is None:
+        return str(_uuid_mod.uuid4())
+    h = hashlib.sha256(f"{seed}{CONFIG['secret']}".encode()).hexdigest()
+    return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
+
+def uptime() -> str:
+    secs = int(time.time() - stats["start_time"])
+    h, m, s = secs // 3600, (secs % 3600) // 60, secs % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+def fmt_bytes(b: int) -> str:
+    if not b: return "نامحدود ♾️"
+    if b >= 1024**3: return f"{b/1024**3:.1f} GB"
+    if b >= 1024**2: return f"{b/1024**2:.1f} MB"
+    return f"{b/1024:.1f} KB"
+
+def parse_size_to_bytes(value: float, unit: str) -> int:
+    u = unit.upper()
+    if u == "GB": return int(value * 1024**3)
+    if u == "MB": return int(value * 1024**2)
+    if u == "KB": return int(value * 1024)
+    return int(value)
+
+def today() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+def now_hour() -> str:
+    return datetime.now().strftime("%H:00")
+
+def is_link_expired(link: dict) -> bool:
+    exp = link.get("expires_at")
+    if not exp: return False
+    return datetime.fromisoformat(exp) <= datetime.now()
+
+def flag(code: str) -> str:
+    if not code or len(code) != 2: return "🌐"
+    return chr(0x1F1E6 + ord(code[0].upper()) - 65) + chr(0x1F1E6 + ord(code[1].upper()) - 65)
+
+# ───────── Xray Config Generator ─────────
+SUPPORTED_PROTOCOLS = ["vless", "trojan", "shadowsocks", "http"]
+
+def build_xray_config() -> dict:
+    """کانفیگ کامل Xray را بر اساس LINKS فعلی می‌سازد."""
+    inbounds = []
+
+    # ── VLESS + WebSocket (پورت داخلی) ──
+    vless_clients = []
+    for uid, link in LINKS.items():
+        if link.get("protocol") == "vless" and link.get("active"):
+            vless_clients.append({"id": uid, "email": uid})
+
+    if vless_clients:
+        inbounds.append({
+            "tag": "vless-in",
+            "listen": "127.0.0.1",
+            "port": CONFIG["xray_vless_port"],
+            "protocol": "vless",
+            "settings": {
+                "clients": vless_clients,
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "ws",
+                "wsSettings": {"path": "/xray-ws"}
+            },
+            "sniffing": {"enabled": True, "destOverride": ["http", "tls"]}
+        })
+
+    # ── Trojan + WebSocket ──
+    trojan_clients = []
+    for uid, link in LINKS.items():
+        if link.get("protocol") == "trojan" and link.get("active"):
+            trojan_clients.append({
+                "password": link.get("password", uid),
+                "email": uid
+            })
+
+    if trojan_clients:
+        inbounds.append({
+            "tag": "trojan-in",
+            "listen": "127.0.0.1",
+            "port": CONFIG["xray_trojan_port"],
+            "protocol": "trojan",
+            "settings": {"clients": trojan_clients},
+            "streamSettings": {
+                "network": "ws",
+                "wsSettings": {"path": "/xray-trojan"}
+            },
+            "sniffing": {"enabled": True, "destOverride": ["http", "tls"]}
+        })
+
+    # ── Shadowsocks ──
+    # هر لینک SS یه پورت مجزا می‌خواد — از پورت پایه + index استفاده می‌کنیم
+    ss_links = [(uid, link) for uid, link in LINKS.items()
+                if link.get("protocol") == "shadowsocks" and link.get("active")]
+    for i, (uid, link) in enumerate(ss_links):
+        inbounds.append({
+            "tag": f"ss-in-{i}",
+            "listen": "0.0.0.0",
+            "port": CONFIG["xray_ss_port"] + i,
+            "protocol": "shadowsocks",
+            "settings": {
+                "method":   link.get("ss_method", "aes-256-gcm"),
+                "password": link.get("password", uid[:16]),
+                "network":  "tcp,udp"
+            },
+            "sniffing": {"enabled": True, "destOverride": ["http", "tls"]}
+        })
+
+    # ── HTTP Proxy ──
+    http_links = [(uid, link) for uid, link in LINKS.items()
+                  if link.get("protocol") == "http" and link.get("active")]
+    for i, (uid, link) in enumerate(http_links):
+        accounts = [{"user": uid[:8], "pass": link.get("password", uid[:16])}]
+        inbounds.append({
+            "tag": f"http-in-{i}",
+            "listen": "0.0.0.0",
+            "port": CONFIG["xray_http_port"] + i,
+            "protocol": "http",
+            "settings": {"accounts": accounts, "allowTransparent": False},
+        })
+
+    # ── Outbound ──
+    outbounds = [
+        {"tag": "direct",  "protocol": "freedom",  "settings": {}},
+        {"tag": "blocked", "protocol": "blackhole", "settings": {}},
+    ]
+
+    # ── Routing ──
+    # اگه فایل‌های geoip/geosite موجود نباشن یا خراب باشن (مثلاً شکست دانلود موقع build)،
+    # رفرنس به geoip:* باعث کرش Xray موقع start می‌شه. پس فقط وقتی فایل سالم هست اضافه‌شون می‌کنیم.
+    routing_rules = []
+    geoip_path = Path(os.environ.get("XRAY_LOCATION_ASSET", "/usr/local/share/xray")) / "geoip.dat"
+    if geoip_path.exists() and geoip_path.stat().st_size > 0:
+        routing_rules = [
+            {"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"},
+            {"type": "field", "ip": ["geoip:cn"],      "outboundTag": "blocked"},
+        ]
+    else:
+        logger.warning("⚠️ geoip.dat یافت نشد یا خالیه؛ قوانین routing مبتنی بر geoip غیرفعال شدن.")
+
+    return {
+        "log": {"loglevel": "warning"},
+        "api": {
+            "tag":      "api",
+            "services": ["HandlerService", "LoggerService", "StatsService"]
+        },
+        "stats": {},
+        "policy": {
+            "system": {
+                "statsInboundUplink":   True,
+                "statsInboundDownlink": True,
+            },
+            "levels": {
+                "0": {
+                    "statsUserUplink":   True,
+                    "statsUserDownlink": True,
+                }
+            }
+        },
+        "inbounds": [
+            {
+                "tag":      "api-in",
+                "listen":   "127.0.0.1",
+                "port":     CONFIG["xray_api_port"],
+                "protocol": "dokodemo-door",
+                "settings": {"address": "127.0.0.1"},
+            },
+            *inbounds
+        ],
+        "outbounds": outbounds,
+        "routing": {
+            "domainStrategy": "IPIfNonMatch",
+            "rules": [
+                {"inboundTag": ["api-in"], "outboundTag": "api", "type": "field"},
+                *routing_rules
+            ]
+        }
+    }
+
+# ───────── Xray Process Management ─────────
+_XRAY_CONFIG_PATH = _DATA_DIR / "xray_config.json"
+
+async def write_xray_config():
+    async with LINKS_LOCK:
+        cfg = build_xray_config()
+    _XRAY_CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2))
+    logger.info(f"✅ Xray config written → {_XRAY_CONFIG_PATH}")
+
+async def start_xray():
+    global xray_process
+    if not XRAY_BIN.exists():
+        logger.error(f"❌ Xray binary not found at {XRAY_BIN}")
+        return
+
+    await write_xray_config()
+
+    # اول پروسه قبلی رو می‌بندیم
+    if xray_process and xray_process.poll() is None:
+        xray_process.terminate()
+        try:
+            await asyncio.to_thread(xray_process.wait, timeout=5)
+        except Exception:
+            xray_process.kill()
+
+    xray_process = subprocess.Popen(
+        [str(XRAY_BIN), "run", "-c", str(_XRAY_CONFIG_PATH)],
+        stdout=None,
+        stderr=subprocess.STDOUT,
+    )
+    logger.info(f"🚀 Xray started (pid={xray_process.pid})")
+
+async def query_xray_stats() -> dict:
+    """مصرف هر کاربر را از Xray API می‌خونه (بدون نیاز به وابستگی جدید، با باینری خود xray)."""
+    if not (xray_process and xray_process.poll() is None):
+        return {}
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            str(XRAY_BIN), "api", "statsquery",
+            f"--server=127.0.0.1:{CONFIG['xray_api_port']}",
+            "-pattern", "user>>>",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=8)
+        data = json.loads(out.decode() or "{}")
+    except Exception as e:
+        logger.warning(f"⚠️ stats query failed: {e}")
+        return {}
+    usage: dict = defaultdict(int)
+    for item in (data.get("stat") or []):
+        parts = str(item.get("name", "")).split(">>>")
+        if len(parts) >= 2:
+            usage[parts[1]] += int(item.get("value", 0) or 0)
+    return usage
+
+async def capture_traffic_baseline():
+    """قبل از ری‌استارت Xray، مصرف فعلی رو به‌عنوان baseline ذخیره می‌کنه تا با ری‌استارت صفر نشه."""
+    usage = await query_xray_stats()
+    if not usage:
+        return
+    async with LINKS_LOCK:
+        for uid, link in LINKS.items():
+            if uid in usage:
+                link["baseline_bytes"] = link.get("baseline_bytes", 0) + usage[uid]
+                link["used_bytes"] = link["baseline_bytes"]
+
+async def reload_xray():
+    """کانفیگ را دوباره می‌نویسد و Xray را restart می‌کند.
+    توجه: Xray-core از SIGHUP پشتیبانی نمی‌کنه؛ باید کامل restart بشه."""
+    await capture_traffic_baseline()
+    await start_xray()
+
+def xray_status() -> dict:
+    if xray_process is None:
+        return {"running": False, "pid": None, "uptime": None}
+    if xray_process.poll() is not None:
+        return {"running": False, "pid": xray_process.pid, "uptime": None}
+    return {"running": True, "pid": xray_process.pid}
+
+# ───────── Persistence ─────────
+async def save_data():
+    try:
+        async with LINKS_LOCK:
+            data = {
+                "links":       {k: dict(v) for k, v in LINKS.items()},
+                "blocked_ips": list(BLOCKED_IPS),
+            }
+        tmp = DATA_FILE.with_suffix(".tmp")
+        await asyncio.to_thread(tmp.write_text, json.dumps(data, ensure_ascii=False, indent=2))
+        tmp.replace(DATA_FILE)
+    except Exception as e:
+        logger.error(f"Save error: {e}")
+
+def load_data():
+    global LINKS, BLOCKED_IPS
+    try:
+        if DATA_FILE.exists():
+            data = json.loads(DATA_FILE.read_text())
+            LINKS.clear()
+            LINKS.update(data.get("links", {}))
+            BLOCKED_IPS.clear()
+            BLOCKED_IPS.update(data.get("blocked_ips", []))
+            logger.info(f"✅ Loaded {len(LINKS)} links")
+    except Exception as e:
+        logger.error(f"Load error: {e}")
+
+# ───────── Background loops ─────────
+async def keepalive_loop():
+    await asyncio.sleep(60)
+    while True:
+        try:
+            host = _detect_host()
+            if host and host != "localhost" and http_client:
+                r = await http_client.get(f"https://{host}/health", timeout=20.0)
+                logger.info(f"🔁 keepalive → {host} [{r.status_code}]")
+        except Exception as exc:
+            logger.warning(f"⚠️ keepalive failed: {exc}")
+        await asyncio.sleep(10 * 60)
+
+async def scheduler_loop():
+    while True:
+        await asyncio.sleep(60)
+        async with LINKS_LOCK:
+            changed = []
+            for uid, link in LINKS.items():
+                if is_link_expired(link) and link.get("active"):
+                    link["active"] = False
+                    changed.append(link.get("label", uid[:8]))
+        if changed:
+            await save_data()
+            await reload_xray()
+            for label in changed:
+                logger.info(f"⏰ لینک '{label}' منقضی و غیرفعال شد.")
+
+async def traffic_loop():
+    """مصرف واقعی هر لینک رو هر ۲ دقیقه از Xray می‌خونه. برای جلوگیری از نوشتن زیاد
+    روی دیسک (و کرش سرور به‌خاطر I/O زیاد)، فقط هر ۱۰ دور یا وقتی سهمیه‌ای تموم بشه ذخیره می‌کنه."""
+    await asyncio.sleep(90)
+    poll_count = 0
+    while True:
+        try:
+            usage = await query_xray_stats()
+            if usage:
+                quota_hit = []
+                async with LINKS_LOCK:
+                    for uid, link in LINKS.items():
+                        if uid in usage:
+                            link["used_bytes"] = link.get("baseline_bytes", 0) + usage[uid]
+                            if link["limit_bytes"] and link["used_bytes"] >= link["limit_bytes"] and link.get("active"):
+                                link["active"] = False
+                                quota_hit.append(link.get("label", uid[:8]))
+                poll_count += 1
+                if quota_hit or poll_count % 10 == 0:
+                    await save_data()
+                if quota_hit:
+                    await reload_xray()
+                    for label in quota_hit:
+                        logger.info(f"📊 سهمیه لینک '{label}' تمام شد و غیرفعال شد.")
+        except Exception as e:
+            logger.warning(f"⚠️ traffic loop error: {e}")
+        await asyncio.sleep(120)
+
+# ───────── Link generation helpers ─────────
+def generate_vless_link(uid: str, host: str, label: str = "tryak") -> str:
+    path = "/xray-ws"
+    params = {
+        "encryption": "none", "security": "tls", "type": "ws",
+        "host": host, "path": path, "sni": host, "fp": "chrome", "alpn": "http/1.1",
+    }
+    q = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
+    return f"vless://{uid}@{host}:443?{q}#{quote(label)}"
+
+def generate_trojan_link(password: str, host: str, label: str = "tryak") -> str:
+    params = {"security": "tls", "type": "ws", "path": "/xray-trojan", "sni": host}
+    q = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
+    return f"trojan://{quote(password)}@{host}:443?{q}#{quote(label)}"
+
+def generate_ss_link(method: str, password: str, host: str, port: int, label: str = "tryak") -> str:
+    import base64 as b64
+    userinfo = b64.urlsafe_b64encode(f"{method}:{password}".encode()).decode().rstrip("=")
+    return f"ss://{userinfo}@{host}:{port}#{quote(label)}"
+
+def get_link_connection_info(uid: str, link: dict, host: str, index: int = 0) -> dict:
+    proto = link.get("protocol", "vless")
+    if proto == "vless":
+        return {
+            "link":     generate_vless_link(uid, host, link.get("label", "tryak")),
+            "protocol": "VLESS + WS + TLS",
+            "server":   host, "port": 443,
+            "path":     "/xray-ws",
+        }
+    elif proto == "trojan":
+        return {
+            "link":     generate_trojan_link(link.get("password", uid), host, link.get("label", "tryak")),
+            "protocol": "Trojan + WS + TLS",
+            "server":   host, "port": 443,
+            "path":     "/xray-trojan",
+        }
+    elif proto == "shadowsocks":
+        port = CONFIG["xray_ss_port"] + index
+        return {
+            "link":     generate_ss_link(link.get("ss_method", "aes-256-gcm"), link.get("password", uid[:16]), host, port, link.get("label", "tryak")),
+            "protocol": f"Shadowsocks ({link.get('ss_method','aes-256-gcm')})",
+            "server":   host, "port": port,
+        }
+    elif proto == "http":
+        port = CONFIG["xray_http_port"] + index
+        return {
+            "link":     f"http://{uid[:8]}:{link.get('password', uid[:16])}@{host}:{port}",
+            "protocol": "HTTP Proxy",
+            "server":   host, "port": port,
+            "username": uid[:8], "password": link.get("password", uid[:16]),
+        }
+    return {}
+
+# ───────── Lifespan ─────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global http_client, keepalive_task, scheduler_task, traffic_task
+    limits  = httpx.Limits(max_connections=200, max_keepalive_connections=50)
+    timeout = httpx.Timeout(30.0, connect=10.0)
+    http_client = httpx.AsyncClient(limits=limits, timeout=timeout, follow_redirects=True)
+
+    load_data()
+    await start_xray()
+
+    keepalive_task = asyncio.create_task(keepalive_loop())
+    scheduler_task = asyncio.create_task(scheduler_loop())
+    traffic_task   = asyncio.create_task(traffic_loop())
+
+    logger.info(f"🚀 tryak-Xray Gateway started on port {CONFIG['port']}")
+    yield
+
+    for t in [keepalive_task, scheduler_task, traffic_task]:
+        if t: t.cancel()
+    if xray_process and xray_process.poll() is None:
+        xray_process.terminate()
+    await save_data()
+    if http_client:
+        await http_client.aclose()
+
+app = FastAPI(title="tryak Xray Gateway", docs_url=None, redoc_url=None, lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
+)
+
+# ───────── Basic Endpoints ─────────
+@app.get("/")
+async def root():
+    return {"service": "tryak Xray Gateway", "version": "1.0", "status": "active", "host": _detect_host()}
+
+@app.get("/health")
+async def health():
+    x = xray_status()
+    return {"status": "ok", "uptime": uptime(), "xray_running": x["running"], "xray_pid": x["pid"]}
+
+# ───────── Auth ─────────
+@app.post("/api/login")
+async def api_login(request: Request):
+    body = await request.json()
+    pw = str(body.get("password") or "")
+    if hash_password(pw) != AUTH["password_hash"]:
+        raise HTTPException(status_code=401, detail="رمز عبور اشتباه است")
+    token = await create_session()
+    resp = JSONResponse({"ok": True})
+    resp.set_cookie(key=SESSION_COOKIE, value=token, max_age=SESSION_TTL,
+                    httponly=True, samesite="lax", path="/")
+    return resp
+
+@app.post("/api/logout")
+async def api_logout(request: Request):
+    await destroy_session(request.cookies.get(SESSION_COOKIE))
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie(SESSION_COOKIE, path="/")
+    return resp
+
+@app.get("/api/me")
+async def api_me(request: Request):
+    valid = await is_valid_session(request.cookies.get(SESSION_COOKIE))
+    return {"authenticated": valid}
+
+# ───────── Stats ─────────
+@app.get("/stats")
+async def get_stats(_=Depends(require_auth)):
+    x = xray_status()
+    async with LINKS_LOCK:
+        lc = len(LINKS)
+    return {
+        "uptime":           uptime(),
+        "platform":         _detect_platform(),
+        "xray":             x,
+        "links_count":      lc,
+        "blocked_ips":      len(BLOCKED_IPS),
+        "cpu_percent":      psutil.cpu_percent(interval=0.1),
+        "memory_percent":   psutil.virtual_memory().percent,
+        "total_bytes":      stats["total_bytes"],
+        "total_requests":   stats["total_requests"],
+        "total_errors":     stats["total_errors"],
+        "recent_errors":    list(error_logs)[-10:],
+        "hourly":           dict(hourly_traffic),
+    }
+
+# ───────── Link Management ─────────
+@app.post("/api/links")
+async def create_link(request: Request, _=Depends(require_auth)):
+    body         = await request.json()
+    label        = (body.get("label") or "لینک جدید").strip()[:60]
+    protocol     = body.get("protocol", "vless")
+    if protocol not in SUPPORTED_PROTOCOLS:
+        raise HTTPException(400, f"پروتکل نامعتبر. مجاز: {SUPPORTED_PROTOCOLS}")
+    limit_value  = float(body.get("limit_value") or 0)
+    limit_unit   = body.get("limit_unit") or "GB"
+    expire_days  = float(body.get("expire_days") or 0)
+    password     = body.get("password") or secrets.token_urlsafe(16)
+    ss_method    = body.get("ss_method") or "aes-256-gcm"
+
+    limit_bytes  = 0 if limit_value <= 0 else parse_size_to_bytes(limit_value, limit_unit)
+    expires_at   = (datetime.now() + timedelta(days=expire_days)).isoformat() if expire_days > 0 else None
+    uid          = str(_uuid_mod.uuid4())  # همیشه uuid4 تازه
+
+    async with LINKS_LOCK:
+        LINKS[uid] = {
+            "label":       label,
+            "protocol":    protocol,
+            "limit_bytes": limit_bytes,
+            "used_bytes":  0,
+            "baseline_bytes": 0,
+            "created_at":  datetime.now().isoformat(),
+            "expires_at":  expires_at,
+            "active":      True,
+            "password":    password,
+            "ss_method":   ss_method,
+        }
+
+    await save_data()
+    await reload_xray()
+
+    host  = _detect_host()
+    idx   = list(LINKS.keys()).index(uid)
+    conn  = get_link_connection_info(uid, LINKS[uid], host, idx)
+
+    return {"uuid": uid, "label": label, "protocol": protocol,
+            "limit_bytes": limit_bytes, "used_bytes": 0, "active": True,
+            "created_at": LINKS[uid]["created_at"], "expires_at": expires_at,
+            "connection": conn}
+
+@app.get("/api/links")
+async def list_links(_=Depends(require_auth)):
+    host = _detect_host()
+    now  = datetime.now()
+    result = []
+    ss_index = 0; http_index = 0
+    async with LINKS_LOCK:
+        for uid, data in LINKS.items():
+            proto = data.get("protocol", "vless")
+            idx   = ss_index if proto == "shadowsocks" else (http_index if proto == "http" else 0)
+            conn  = get_link_connection_info(uid, data, host, idx)
+            if proto == "shadowsocks": ss_index += 1
+            if proto == "http": http_index += 1
+
+            expires_at  = data.get("expires_at")
+            is_expired  = False
+            days_left   = None
+            if expires_at:
+                exp_dt    = datetime.fromisoformat(expires_at)
+                days_left = (exp_dt - now).total_seconds() / 86400
+                if days_left <= 0:
+                    is_expired = True; days_left = 0
+
+            quota_exceeded = data["limit_bytes"] != 0 and data["used_bytes"] >= data["limit_bytes"]
+            result.append({
+                "uuid":           uid,
+                "label":          data["label"],
+                "protocol":       proto,
+                "limit_bytes":    data["limit_bytes"],
+                "used_bytes":     data["used_bytes"],
+                "active":         data["active"],
+                "created_at":     data["created_at"],
+                "expires_at":     expires_at,
+                "days_left":      None if days_left is None else round(days_left, 1),
+                "is_expired":     is_expired,
+                "quota_exceeded": quota_exceeded,
+                "connection":     conn,
+            })
+    result.sort(key=lambda x: x["created_at"], reverse=True)
+    return {"links": result}
+
+@app.patch("/api/links/{uid}")
+async def update_link(uid: str, request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    async with LINKS_LOCK:
+        if uid not in LINKS:
+            raise HTTPException(404, "link not found")
+        link = LINKS[uid]
+        if "active"       in body: link["active"]    = bool(body["active"])
+        if "label"        in body: link["label"]     = str(body["label"]).strip()[:60]
+        if "limit_value"  in body:
+            lv = float(body.get("limit_value") or 0)
+            lu = body.get("limit_unit") or "GB"
+            link["limit_bytes"] = 0 if lv <= 0 else parse_size_to_bytes(lv, lu)
+        if "reset_usage"  in body and body["reset_usage"]:
+            link["used_bytes"] = 0
+            link["baseline_bytes"] = 0
+        if "expire_days"  in body:
+            ed = float(body.get("expire_days") or 0)
+            link["expires_at"] = (datetime.now() + timedelta(days=ed)).isoformat() if ed > 0 else None
+        if "password"     in body: link["password"]  = str(body["password"])
+        if "ss_method"    in body: link["ss_method"] = str(body["ss_method"])
+
+    await save_data()
+    await reload_xray()
+    return {"ok": True}
+
+@app.delete("/api/links/{uid}")
+async def delete_link(uid: str, _=Depends(require_auth)):
+    async with LINKS_LOCK:
+        LINKS.pop(uid, None)
+    await save_data()
+    await reload_xray()
+    return {"ok": True}
+
+# ───────── Xray Control ─────────
+@app.post("/api/xray/restart")
+async def xray_restart(_=Depends(require_auth)):
+    await reload_xray()
+    return {"ok": True, "xray": xray_status()}
+
+@app.get("/api/xray/config")
+async def xray_config(_=Depends(require_auth)):
+    async with LINKS_LOCK:
+        cfg = build_xray_config()
+    return cfg
+
+@app.get("/api/xray/status")
+async def get_xray_status(_=Depends(require_auth)):
+    return xray_status()
+
+# ───────── Blocked IPs ─────────
+@app.get("/api/blocked")
+async def get_blocked(_=Depends(require_auth)):
+    return {"blocked_ips": list(BLOCKED_IPS)}
+
+@app.post("/api/blocked")
+async def block_ip(request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    ip = str(body.get("ip", "")).strip()
+    if not ip: raise HTTPException(400, "IP required")
+    BLOCKED_IPS.add(ip)
+    await save_data()
+    return {"ok": True}
+
+@app.delete("/api/blocked/{ip}")
+async def unblock_ip(ip: str, _=Depends(require_auth)):
+    BLOCKED_IPS.discard(ip)
+    await save_data()
+    return {"ok": True}
+
+# ───────── Subscription Page ─────────
+@app.get("/sub/{uid}", response_class=HTMLResponse)
+async def subscription_page(uid: str, request: Request):
+    async with LINKS_LOCK:
+        link = LINKS.get(uid)
+    if not link:
+        raise HTTPException(404, "لینک یافت نشد")
+
+    host     = _detect_host()
+    proto    = link.get("protocol", "vless")
+    is_active = link.get("active", False) and not is_link_expired(link)
+    label    = link.get("label", "کاربر")
+    used     = fmt_bytes(link.get("used_bytes", 0))
+    limit    = fmt_bytes(link.get("limit_bytes", 0))
+    limit_b  = link.get("limit_bytes", 0)
+    used_b   = link.get("used_bytes", 0)
+    pct      = round(used_b / limit_b * 100, 1) if limit_b > 0 else 0
+
+    ss_idx   = sum(1 for u, l in LINKS.items() if l.get("protocol") == "shadowsocks" and u < uid)
+    http_idx = sum(1 for u, l in LINKS.items() if l.get("protocol") == "http" and u < uid)
+    idx      = ss_idx if proto == "shadowsocks" else (http_idx if proto == "http" else 0)
+    conn     = get_link_connection_info(uid, link, host, idx)
+
+    exp = link.get("expires_at")
+    never_expire = not exp
+    exp_str = datetime.fromisoformat(exp).strftime("%Y/%m/%d") if exp else "—"
+    days_left = 0
+    if exp:
+        days_left = max(0, int((datetime.fromisoformat(exp) - datetime.now()).total_seconds() / 86400))
+
+    proto_badge = {"vless": "VLESS · WS · TLS", "trojan": "Trojan · WS · TLS",
+                   "shadowsocks": f"Shadowsocks · {link.get('ss_method','')}", "http": "HTTP Proxy"}.get(proto, proto)
+    bar = "#6366f1" if pct < 70 else ("#f0b14a" if pct < 90 else "#f56565")
+    status_text = "فعال" if is_active else "غیرفعال"
+
+    html = f"""<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>پروفایل · {label}</title>
+<link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@3.19.0/dist/tabler-icons.min.css">
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+:root{{--accent:#6366f1;--accent2:#4f46e5;--accent-glow:rgba(99,102,241,0.35);--green:#4ce090;--red:#f56565;--amber:#f0b14a;--bg:#0a0e17;--card:#10172a;--card2:#151d33;--border:#1f2940;--text-1:#eef2ff;--text-2:#7b8aab;--text-3:#475370}}
+body{{font-family:'Vazirmatn',sans-serif;background:radial-gradient(circle at 20% 20%,rgba(59,130,246,0.18),transparent 45%),radial-gradient(circle at 80% 80%,rgba(29,78,216,0.15),transparent 45%),var(--bg);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px;color:var(--text-1)}}
+.card{{background:var(--card);border-radius:20px;width:100%;max-width:400px;border:1px solid var(--border);overflow:hidden;box-shadow:0 24px 70px rgba(0,0,0,.55)}}
+.card-header{{padding:22px 24px 18px;background:linear-gradient(135deg,rgba(99,102,241,0.15),rgba(29,78,216,0.08));border-bottom:1px solid var(--border)}}
+.logo-row{{display:flex;align-items:center;gap:14px;margin-bottom:16px}}
+.logo-icon{{font-size:48px;font-weight:900;color:#6366f1;font-family:'Vazirmatn',sans-serif;line-height:1}}
+.logo-text .name{{font-size:17px;font-weight:800;color:#fff}}
+.logo-text .sub{{font-size:11px;color:rgba(147,197,253,0.8);margin-top:2px}}
+.user-section{{display:flex;align-items:center;gap:12px}}
+.avatar{{width:42px;height:42px;border-radius:50%;background:rgba(59,130,246,0.18);border:2px solid rgba(59,130,246,0.3);display:flex;align-items:center;justify-content:center;font-size:19px}}
+.user-name{{font-size:16px;font-weight:700;color:#fff}}
+.user-id{{font-size:10px;color:rgba(147,197,253,0.6);font-family:ui-monospace,monospace;margin-top:2px;word-break:break-all}}
+.status-pill{{display:inline-flex;align-items:center;gap:6px;padding:4px 12px;border-radius:20px;font-size:11px;font-weight:600;background:rgba(76,224,144,0.1);border:1px solid rgba(76,224,144,0.2);color:var(--green);margin-top:8px}}
+.status-pill.inactive{{background:rgba(245,101,101,0.1);border-color:rgba(245,101,101,0.2);color:var(--red)}}
+.status-dot{{width:6px;height:6px;border-radius:50%;background:currentColor;animation:pulse 2s infinite}}
+@keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:.35}}}}
+.card-body{{padding:22px 24px 26px}}
+.stats-grid{{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:20px}}
+.stat-box{{background:var(--card2);border-radius:12px;border:1px solid var(--border);padding:12px 14px}}
+.stat-label{{font-size:10px;color:var(--text-2);font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px}}
+.stat-val{{font-size:19px;font-weight:700;color:var(--text-1)}}
+.stat-unit{{font-size:10.5px;color:var(--text-2);margin-top:2px}}
+.usage-header{{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px}}
+.usage-title{{font-size:12px;font-weight:600;color:var(--text-2)}}
+.usage-numbers span{{color:var(--text-1);font-weight:700;font-size:12px}}
+.progress-track{{height:9px;border-radius:6px;background:var(--card2);border:1px solid var(--border);overflow:hidden;margin-bottom:4px}}
+.progress-fill{{height:100%;border-radius:6px;transition:width .6s;background:{bar}}}
+.progress-pct{{font-size:10px;color:var(--text-2)}}
+.info-rows{{margin:18px 0}}
+.info-row{{display:flex;justify-content:space-between;align-items:center;padding:9px 0;border-bottom:1px solid var(--border);font-size:12px}}
+.info-row:last-child{{border-bottom:none}}
+.info-key{{color:var(--text-2);display:flex;align-items:center;gap:7px}}
+.info-key i{{font-size:14px}}
+.info-val{{color:var(--text-1);font-weight:600}}
+.conn-section{{background:var(--card2);border-radius:12px;border:1px solid var(--border);padding:14px}}
+.conn-label{{font-size:11px;font-weight:600;color:var(--text-2);margin-bottom:8px;display:flex;align-items:center;gap:6px}}
+.conn-label i{{font-size:13px;color:var(--accent)}}
+.conn-text{{font-family:ui-monospace,monospace;font-size:9.5px;color:#93c5fd;word-break:break-all;line-height:1.7;background:rgba(0,0,0,.2);border-radius:8px;padding:10px 12px;margin-bottom:10px}}
+.btn-row{{display:flex;gap:8px;flex-wrap:wrap}}
+.btn{{font-family:inherit;font-size:12px;font-weight:600;border-radius:9px;padding:9px 14px;cursor:pointer;display:inline-flex;align-items:center;gap:6px;border:none;transition:.15s;flex:1;justify-content:center}}
+.btn-primary{{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;box-shadow:0 2px 10px var(--accent-glow)}}
+.btn-primary:hover{{filter:brightness(1.1)}}
+.btn-outline{{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.12);color:var(--text-1)}}
+.proto-badge{{display:inline-block;font-size:10px;background:rgba(99,102,241,0.12);color:#a5b4fc;border:1px solid rgba(99,102,241,0.2);border-radius:6px;padding:2px 8px;font-weight:600;margin-top:4px}}
+.footer{{text-align:center;font-size:10px;color:var(--text-3);padding-top:16px}}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="card-header">
+    <div class="logo-row">
+      <div class="logo-icon">T</div>
+      <div class="logo-text"><div class="name">tryak</div><div class="sub">پروفایل اشتراک</div></div>
+    </div>
+    <div class="user-section">
+      <div class="avatar"><i class="ti ti-user"></i></div>
+      <div>
+        <div class="user-name">{label}</div>
+        <div class="user-id">{uid}</div>
+        <div class="proto-badge">{proto_badge}</div>
+        <div class="status-pill{'' if is_active else ' inactive'}">
+          <span class="status-dot"></span>{status_text}
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="card-body">
+    <div class="stats-grid">
+      <div class="stat-box">
+        <div class="stat-label">کل مصرف</div>
+        <div class="stat-val">{used.split()[0]}</div>
+        <div class="stat-unit">{used.split()[-1] if len(used.split())>1 else ''} / {limit}</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">وضعیت سرویس</div>
+        <div class="stat-val" style="font-size:14px;margin-top:4px">{'✅ فعال' if is_active else '❌ غیرفعال'}</div>
+      </div>
+    </div>
+    <div>
+      <div class="usage-header">
+        <div class="usage-title">مصرف ترافیک</div>
+        <div class="usage-numbers"><span>{used}</span> از {limit}</div>
+      </div>
+      <div class="progress-track"><div class="progress-fill" style="width:{pct if limit_b>0 else 0}%"></div></div>
+      <div class="progress-pct">{pct}٪ مصرف شده</div>
+    </div>
+    <div class="info-rows">
+      <div class="info-row"><span class="info-key"><i class="ti ti-calendar"></i> تاریخ انقضا</span><span class="info-val">{'بدون انقضا ♾️' if never_expire else exp_str}</span></div>
+      <div class="info-row"><span class="info-key"><i class="ti ti-clock"></i> روزهای باقی‌مانده</span><span class="info-val">{'♾️ نامحدود' if never_expire else f'{days_left} روز'}</span></div>
+      <div class="info-row"><span class="info-key"><i class="ti ti-server"></i> سرور</span><span class="info-val">{host}</span></div>
+      <div class="info-row"><span class="info-key"><i class="ti ti-shield-lock"></i> پروتکل</span><span class="info-val">{proto_badge}</span></div>
+    </div>
+    <div class="conn-section">
+      <div class="conn-label"><i class="ti ti-link"></i> لینک اتصال</div>
+      <div class="conn-text" id="conn-link">{conn.get('link','')}</div>
+      <div class="btn-row">
+        <button class="btn btn-primary" onclick="copyLink()"><i class="ti ti-copy"></i> کپی لینک</button>
+        {'<button class="btn btn-outline" onclick="showQR()"><i class="ti ti-qrcode"></i> QR</button>' if proto in ('vless','trojan','shadowsocks') else ''}
+      </div>
+    </div>
+    <div class="footer">tryak · Xray Gateway</div>
+  </div>
+</div>
+<script>
+function copyLink(){{
+  const t=document.getElementById('conn-link').textContent.trim();
+  navigator.clipboard.writeText(t).then(()=>{{
+    const b=event.currentTarget;const o=b.innerHTML;
+    b.innerHTML='<i class="ti ti-check"></i> کپی شد!';
+    setTimeout(()=>b.innerHTML=o,2000);
+  }});
+}}
+function showQR(){{
+  const t=document.getElementById('conn-link').textContent.trim();
+  window.open('https://api.qrserver.com/v1/create-qr-code/?size=300x300&data='+encodeURIComponent(t),'_blank');
+}}
+</script>
+</body>
+</html>"""
+    return HTMLResponse(content=html)
+
+# ───────── Login Page ─────────
+LOGIN_HTML = r"""<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>ورود · tryak Xray</title>
+<link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@3.19.0/dist/tabler-icons.min.css">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--accent:#6366f1;--accent2:#4f46e5;--accent-glow:rgba(99,102,241,0.35);--bg:#0a0e17;--card:#10172a;--card2:#151d33;--border:#1f2940;--text-1:#eef2ff;--text-2:#7b8aab;--red-bg:#2a1212;--red-text:#f5a3a3;--green-text:#7ee0a8}
+html,body{height:100%}
+body{font-family:'Vazirmatn',sans-serif;background:radial-gradient(circle at 18% 18%,rgba(59,130,246,0.16),transparent 42%),radial-gradient(circle at 85% 80%,rgba(29,78,216,0.16),transparent 45%),var(--bg);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;color:var(--text-1)}
+.card{background:var(--card);border-radius:20px;padding:36px 30px;width:100%;max-width:380px;box-shadow:0 24px 70px rgba(0,0,0,.55);border:1px solid var(--border);position:relative;overflow:hidden}
+.card::before{content:'';position:absolute;top:-60%;right:-40%;width:280px;height:280px;background:radial-gradient(circle,var(--accent-glow),transparent 70%);pointer-events:none}
+.logo{display:flex;flex-direction:column;align-items:center;gap:12px;margin-bottom:24px;position:relative;z-index:1}
+.logo-icon{font-size:68px;font-weight:900;color:#6366f1;line-height:1;font-family:'Vazirmatn',sans-serif}
+.logo-name{font-size:20px;font-weight:800;color:var(--text-1)}
+.logo-sub{font-size:11px;color:var(--accent);font-weight:600;letter-spacing:.04em}
+.status-pill{display:flex;align-items:center;justify-content:center;gap:7px;font-size:11px;color:var(--green-text);background:rgba(76,224,144,0.08);border:1px solid rgba(76,224,144,0.18);border-radius:20px;padding:6px 14px;margin-bottom:20px;position:relative;z-index:1;font-weight:500}
+.dot{width:6px;height:6px;border-radius:50%;background:#4ce090;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+.form-group{margin-bottom:14px;position:relative;z-index:1}
+.form-label{font-size:11.5px;font-weight:600;color:var(--text-2);margin-bottom:6px;display:block}
+.form-input{width:100%;padding:13px 15px;border-radius:11px;border:1px solid var(--border);font-family:inherit;font-size:14px;outline:none;background:var(--card2);color:var(--text-1);transition:.15s}
+.form-input:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-glow)}
+.btn-login{width:100%;padding:14px;border-radius:11px;border:none;cursor:pointer;background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;font-family:inherit;font-size:14px;font-weight:700;display:flex;align-items:center;justify-content:center;gap:8px;transition:.15s;box-shadow:0 4px 20px var(--accent-glow);position:relative;z-index:1}
+.btn-login:hover{filter:brightness(1.1)}
+.btn-login:disabled{opacity:.6;cursor:not-allowed}
+.error-box{background:var(--red-bg);color:var(--red-text);font-size:12.5px;padding:10px 13px;border-radius:9px;margin-bottom:14px;display:none;align-items:center;gap:8px;border:1px solid rgba(240,128,128,.2);position:relative;z-index:1}
+.error-box.show{display:flex}
+.footer{margin-top:18px;text-align:center;font-size:11px;color:var(--text-2);position:relative;z-index:1}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">
+    <div class="logo-icon">T</div>
+    <div style="text-align:center">
+      <div class="logo-name">tryak</div>
+      <div class="logo-sub">Xray Gateway · v1.0</div>
+    </div>
+  </div>
+  <div class="status-pill"><span class="dot"></span>سیستم آنلاین · Xray Core</div>
+  <div class="error-box" id="err"><i class="ti ti-alert-circle"></i><span id="err-text"></span></div>
+  <div class="form-group">
+    <label class="form-label">رمز عبور</label>
+    <input class="form-input" type="password" id="pw" placeholder="••••••••" autofocus>
+  </div>
+  <button class="btn-login" id="btn" onclick="doLogin()"><i class="ti ti-login-2"></i> ورود</button>
+  <div class="footer">tryak · Railway / Render</div>
+</div>
+<script>
+const err=document.getElementById('err');
+const errT=document.getElementById('err-text');
+const btn=document.getElementById('btn');
+document.getElementById('pw').addEventListener('keydown',e=>{if(e.key==='Enter')doLogin()});
+async function doLogin(){
+  err.classList.remove('show');
+  btn.disabled=true;
+  btn.innerHTML='<i class="ti ti-loader-2"></i> در حال ورود...';
+  const pw=document.getElementById('pw').value;
+  try{
+    const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});
+    if(!r.ok){const d=await r.json().catch(()=>({}));throw new Error(d.detail||'رمز اشتباه است');}
+    location.href='/dashboard';
+  }catch(e){
+    errT.textContent=e.message;err.classList.add('show');
+    btn.disabled=false;btn.innerHTML='<i class="ti ti-login-2"></i> ورود';
+  }
+}
+</script>
+</body>
+</html>"""
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(request: Request):
+    if await is_valid_session(request.cookies.get(SESSION_COOKIE)):
+        return RedirectResponse("/dashboard")
+    return HTMLResponse(content=LOGIN_HTML)
+
+# ───────── Dashboard ─────────
+DASHBOARD_HTML = r"""<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>tryak · Xray داشبورد</title>
+<link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@3.19.0/dist/tabler-icons.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --accent:#6366f1;--accent2:#4f46e5;--accent-glow:rgba(99,102,241,0.35);
+  --green-text:#7ee0a8;--green-dot:#4ce090;--red-text:#f5a3a3;--red-dot:#f56565;
+  --amber-text:#f0c878;--amber-dot:#f0b14a;
+  --border:#1f2940;--bg:#0a0e17;--card:#10172a;--card2:#151d33;
+  --text-1:#eef2ff;--text-2:#7b8aab;--text-3:#475370;
+  --shadow:0 1px 2px rgba(0,0,0,.5),0 1px 16px rgba(0,0,0,.35);
+}
+html,body{height:100%}
+body{font-family:'Vazirmatn',sans-serif;background:radial-gradient(circle at 15% 10%,rgba(59,130,246,.10),transparent 40%),radial-gradient(circle at 90% 85%,rgba(29,78,216,.10),transparent 45%),var(--bg);color:var(--text-1);min-height:100vh;display:flex;font-size:14px}
+::-webkit-scrollbar{width:5px;height:5px}
+::-webkit-scrollbar-thumb{background:var(--card2);border-radius:3px}
+
+/* SIDEBAR */
+.sidebar{width:232px;min-height:100vh;background:linear-gradient(180deg,var(--card) 0%,#070c18 100%);border-left:1px solid var(--border);display:flex;flex-direction:column;flex-shrink:0;position:fixed;right:0;top:0;bottom:0;z-index:200;transition:transform .25s}
+.logo{display:flex;align-items:center;gap:10px;padding:20px 16px;border-bottom:1px solid var(--border)}
+.logo-icon{font-size:38px;font-weight:900;color:#6366f1;line-height:1;font-family:'Vazirmatn',sans-serif}
+.logo-name{color:#fff;font-size:15px;font-weight:700}
+.logo-sub{color:var(--accent);font-size:10.5px;margin-top:1px}
+.sidebar-close{display:none;position:absolute;left:12px;top:16px;background:var(--card2);border:none;color:#fff;width:32px;height:32px;border-radius:8px;font-size:17px;align-items:center;justify-content:center;cursor:pointer}
+.nav-scroll{flex:1;overflow-y:auto;padding-bottom:10px}
+.nav-label{color:var(--text-3);font-size:10px;letter-spacing:.1em;padding:16px 18px 5px;text-transform:uppercase;font-weight:600}
+.nav-item{display:flex;align-items:center;gap:10px;padding:10px 18px;color:var(--text-2);font-size:13px;cursor:pointer;border-left:3px solid transparent;transition:.15s;user-select:none}
+.nav-item i{font-size:17px;width:20px;text-align:center}
+.nav-item:hover{background:rgba(255,255,255,.03);color:#fff}
+.nav-item.active{background:linear-gradient(90deg,rgba(59,130,246,.16),rgba(59,130,246,.02));color:#fff;border-left-color:var(--accent)}
+.sidebar-footer{padding:14px 16px;border-top:1px solid var(--border)}
+.logout-btn{display:flex;align-items:center;justify-content:center;gap:8px;background:rgba(245,101,101,.1);color:var(--red-text);border-radius:10px;padding:10px;font-size:12.5px;font-weight:500;font-family:inherit;border:1px solid rgba(245,101,101,.2);cursor:pointer;width:100%;transition:.15s}
+.logout-btn:hover{background:rgba(245,101,101,.2);color:#fff}
+
+/* MOBILE */
+.mobile-topbar{display:none;position:fixed;top:0;right:0;left:0;height:54px;background:linear-gradient(180deg,var(--card) 0%,#070c18 100%);border-bottom:1px solid var(--border);z-index:150;align-items:center;justify-content:space-between;padding:0 14px}
+.mt-title{color:#fff;font-size:14px;font-weight:700}
+.menu-btn{background:var(--card2);border:none;color:#fff;width:36px;height:36px;border-radius:9px;font-size:18px;display:flex;align-items:center;justify-content:center;cursor:pointer}
+.sidebar-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:190;backdrop-filter:blur(2px)}
+.sidebar-overlay.show{display:block}
+
+/* MAIN */
+.main{margin-right:232px;flex:1;padding:24px 26px 50px;max-width:calc(100% - 232px)}
+.page{display:none}
+.page.active{display:block;animation:fadeIn .22s ease}
+@keyframes fadeIn{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
+.topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:24px;flex-wrap:wrap;gap:10px}
+.topbar-title{font-size:19px;font-weight:700;color:var(--text-1);display:flex;align-items:center;gap:8px}
+.topbar-title i{color:var(--accent);font-size:21px}
+.topbar-sub{font-size:12px;color:var(--text-2);margin-top:2px}
+
+/* METRICS */
+.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}
+.metric{background:var(--card);border-radius:13px;border:1px solid var(--border);padding:16px 18px;box-shadow:var(--shadow)}
+.metric-label{font-size:10.5px;color:var(--text-2);font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px;display:flex;align-items:center;gap:6px}
+.metric-label i{font-size:16px;color:var(--accent)}
+.metric-val{font-size:24px;font-weight:700;color:var(--text-1);line-height:1}
+.metric-sub{font-size:11px;color:var(--text-2);margin-top:4px}
+
+/* CARDS */
+.card{background:var(--card);border-radius:13px;border:1px solid var(--border);padding:18px 20px;box-shadow:var(--shadow)}
+.card-title{font-size:13px;font-weight:700;color:var(--text-1);margin-bottom:14px;display:flex;align-items:center;gap:7px}
+.card-title i{font-size:17px;color:var(--accent)}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:18px}
+
+/* BUTTONS */
+.btn{font-family:inherit;font-size:12.5px;font-weight:600;border-radius:9px;padding:8px 14px;cursor:pointer;display:inline-flex;align-items:center;gap:6px;border:none;transition:.15s}
+.btn-primary{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;box-shadow:0 2px 10px var(--accent-glow)}
+.btn-primary:hover{filter:brightness(1.1)}
+.btn-outline{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.15);color:var(--text-2)}
+.btn-outline:hover{background:rgba(255,255,255,.08);color:#fff}
+.btn-danger{background:rgba(245,101,101,.1);color:var(--red-text);border:1px solid rgba(245,101,101,.25)}
+.btn-danger:hover{background:rgba(245,101,101,.2)}
+.btn-sm{padding:5px 10px;font-size:11.5px;border-radius:7px}
+.btn i{font-size:14px}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+
+/* FORM */
+.form-row{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:14px}
+.form-group{display:flex;flex-direction:column;gap:5px}
+.form-label{font-size:11px;color:var(--text-2);font-weight:600}
+.form-input,.form-select{padding:9px 12px;border-radius:9px;border:1px solid var(--border);font-family:inherit;font-size:12.5px;outline:none;color:var(--text-1);background:var(--card2);min-width:110px;transition:.15s}
+.form-input:focus,.form-select:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-glow)}
+.form-select option{background:var(--card2)}
+
+/* TABLE */
+.links-table{width:100%;border-collapse:collapse}
+.links-table th{text-align:right;font-size:11px;color:var(--text-2);font-weight:600;padding:8px 7px;border-bottom:2px solid var(--border);white-space:nowrap}
+.links-table td{padding:12px 7px;border-bottom:1px solid var(--border);font-size:12px;vertical-align:middle}
+.links-table tr:last-child td{border-bottom:none}
+.links-table tr:hover td{background:var(--card2)}
+.usage-bar{height:6px;border-radius:3px;background:var(--card2);overflow:hidden;margin-bottom:3px;min-width:100px}
+.usage-bar-fill{height:100%;border-radius:3px;transition:width .3s}
+.usage-text{font-size:10px;color:var(--text-2)}
+.empty-state{text-align:center;padding:44px 20px;color:var(--text-2)}
+.empty-state i{font-size:40px;color:var(--border);margin-bottom:10px;display:block}
+
+/* BADGES / PILLS */
+.pill{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:20px;font-size:10.5px;font-weight:600}
+.pill-green{background:rgba(76,224,144,.1);border:1px solid rgba(76,224,144,.2);color:var(--green-text)}
+.pill-red{background:rgba(245,101,101,.1);border:1px solid rgba(245,101,101,.2);color:var(--red-text)}
+.pill-amber{background:rgba(240,177,74,.1);border:1px solid rgba(240,177,74,.2);color:var(--amber-text)}
+.pill-blue{background:rgba(59,130,246,.1);border:1px solid rgba(59,130,246,.2);color:#93c5fd}
+.pill-dot{width:5px;height:5px;border-radius:50%;background:currentColor}
+.proto-badge{display:inline-block;font-size:10px;background:rgba(99,102,241,.12);color:#a5b4fc;border:1px solid rgba(99,102,241,.2);border-radius:6px;padding:2px 7px;font-weight:600}
+
+/* TOGGLE */
+.toggle{width:36px;height:20px;border-radius:20px;background:var(--card2);position:relative;cursor:pointer;transition:.2s;flex-shrink:0;border:none}
+.toggle::after{content:'';position:absolute;width:14px;height:14px;border-radius:50%;background:#fff;top:3px;right:3px;transition:.2s;box-shadow:0 1px 3px rgba(0,0,0,.4)}
+.toggle.on{background:var(--green-dot)}
+.toggle.on::after{right:19px}
+
+/* TOAST */
+.toast{position:fixed;bottom:26px;left:50%;transform:translateX(-50%) translateY(40px);background:var(--card);color:#fff;border:1px solid var(--border);border-radius:10px;padding:10px 20px;font-size:13px;opacity:0;transition:all .3s;z-index:999;pointer-events:none;display:flex;align-items:center;gap:8px;box-shadow:0 6px 24px rgba(0,0,0,.4)}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+.toast.err{background:#3b1515;border-color:var(--red-dot)}
+
+/* MODAL */
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:500;align-items:center;justify-content:center;backdrop-filter:blur(2px);padding:16px}
+.modal-overlay.show{display:flex}
+.modal{background:var(--card);border-radius:16px;border:1px solid var(--border);padding:26px 24px;width:100%;max-width:480px;max-height:90vh;overflow-y:auto}
+.modal-title{font-size:15px;font-weight:700;color:var(--text-1);margin-bottom:20px;display:flex;align-items:center;gap:8px}
+.modal-title i{font-size:18px;color:var(--accent)}
+.modal-footer{display:flex;gap:10px;justify-content:flex-end;margin-top:20px;padding-top:16px;border-top:1px solid var(--border)}
+
+/* XRAY STATUS CARD */
+.xray-status-card{background:linear-gradient(135deg,rgba(99,102,241,.12),rgba(29,78,216,.06));border:1px solid rgba(99,102,241,.2);border-radius:13px;padding:18px 20px;margin-bottom:18px;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.xray-info{display:flex;align-items:center;gap:12px}
+.xray-icon{width:44px;height:44px;border-radius:12px;background:rgba(99,102,241,.15);display:flex;align-items:center;justify-content:center;font-size:22px;color:var(--accent)}
+.xray-name{font-size:14px;font-weight:700;color:#fff;margin-bottom:3px}
+.xray-pid{font-size:11px;color:var(--text-2);font-family:ui-monospace,monospace}
+
+/* CONN DETAIL */
+.conn-box{background:var(--card2);border-radius:10px;border:1px solid var(--border);padding:12px 14px;font-family:ui-monospace,monospace;font-size:10.5px;color:#93c5fd;word-break:break-all;line-height:1.8;margin-bottom:10px}
+
+/* STATUS ROW */
+.status-row{display:flex;align-items:center;justify-content:space-between;padding:9px 0;border-bottom:1px solid var(--border);font-size:12.5px}
+.status-row:last-child{border-bottom:none}
+.status-key{color:var(--text-2);display:flex;align-items:center;gap:7px}
+.status-key i{font-size:14px}
+.status-val{color:#93c5fd;font-weight:600}
+
+/* RESPONSIVE */
+@media(max-width:900px){
+  .metrics{grid-template-columns:1fr 1fr}
+  .sidebar{transform:translateX(100%)}
+  .sidebar.open{transform:translateX(0)}
+  .sidebar-close{display:flex}
+  .main{margin-right:0;max-width:100%;padding:70px 14px 40px}
+  .mobile-topbar{display:flex}
+}
+@media(max-width:560px){
+  .metrics{grid-template-columns:1fr 1fr}
+  .grid2{grid-template-columns:1fr}
+  .links-table{display:block;overflow-x:auto}
+}
+</style>
+</head>
+<body>
+<div class="sidebar" id="sidebar">
+  <div class="logo">
+    <div class="logo-icon">T</div>
+    <div><div class="logo-name">tryak</div><div class="logo-sub">Xray Gateway</div></div>
+  </div>
+  <button class="sidebar-close" onclick="closeSidebar()"><i class="ti ti-x"></i></button>
+  <div class="nav-scroll">
+    <div class="nav-label">منو</div>
+    <div class="nav-item active" onclick="showPage('overview')"><i class="ti ti-layout-dashboard"></i>داشبورد</div>
+    <div class="nav-item" onclick="showPage('links')"><i class="ti ti-users"></i>لینک‌ها</div>
+    <div class="nav-item" onclick="showPage('xray')"><i class="ti ti-cpu"></i>Xray Core</div>
+    <div class="nav-item" onclick="showPage('blocked')"><i class="ti ti-shield-off"></i>بلاک‌ها</div>
+  </div>
+  <div class="sidebar-footer">
+    <button class="logout-btn" onclick="doLogout()"><i class="ti ti-logout"></i>خروج</button>
+  </div>
+</div>
+<div class="sidebar-overlay" id="overlay" onclick="closeSidebar()"></div>
+
+<div class="mobile-topbar">
+  <span class="mt-title">tryak · Xray</span>
+  <button class="menu-btn" onclick="openSidebar()"><i class="ti ti-menu-2"></i></button>
+</div>
+
+<div class="main">
+
+  <!-- OVERVIEW -->
+  <div class="page active" id="page-overview">
+    <div class="topbar">
+      <div><div class="topbar-title"><i class="ti ti-layout-dashboard"></i>داشبورد</div>
+      <div class="topbar-sub" id="uptime-text">در حال بارگذاری...</div></div>
+      <button class="btn btn-outline btn-sm" onclick="loadStats()"><i class="ti ti-refresh"></i>بروزرسانی</button>
+    </div>
+    <div class="metrics">
+      <div class="metric"><div class="metric-label"><i class="ti ti-users"></i>لینک‌ها</div><div class="metric-val" id="m-links">—</div><div class="metric-sub">تعداد کل</div></div>
+      <div class="metric"><div class="metric-label"><i class="ti ti-cpu"></i>CPU</div><div class="metric-val" id="m-cpu">—</div><div class="metric-sub">درصد مصرف</div></div>
+      <div class="metric"><div class="metric-label"><i class="ti ti-brain"></i>RAM</div><div class="metric-val" id="m-ram">—</div><div class="metric-sub">درصد مصرف</div></div>
+      <div class="metric"><div class="metric-label"><i class="ti ti-shield"></i>بلاک‌شده</div><div class="metric-val" id="m-blocked">—</div><div class="metric-sub">IP</div></div>
+    </div>
+    <div class="grid2">
+      <div class="card">
+        <div class="card-title"><i class="ti ti-server"></i>وضعیت سیستم</div>
+        <div id="sys-rows"><div style="color:var(--text-2);font-size:12px">در حال بارگذاری...</div></div>
+      </div>
+      <div class="card">
+        <div class="card-title"><i class="ti ti-chart-bar"></i>ترافیک امروز</div>
+        <div id="chart-today" style="color:var(--text-2);font-size:12px;padding:20px 0;text-align:center">—</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- LINKS -->
+  <div class="page" id="page-links">
+    <div class="topbar">
+      <div><div class="topbar-title"><i class="ti ti-users"></i>مدیریت لینک‌ها</div></div>
+      <button class="btn btn-primary" onclick="showCreateModal()"><i class="ti ti-plus"></i>لینک جدید</button>
+    </div>
+    <div class="card" style="margin-bottom:16px;overflow-x:auto">
+      <table class="links-table">
+        <thead>
+          <tr>
+            <th>نام</th><th>پروتکل</th><th>مصرف</th><th>وضعیت</th><th>انقضا</th><th>عملیات</th>
+          </tr>
+        </thead>
+        <tbody id="links-tbody"><tr><td colspan="6" class="empty-state"><i class="ti ti-loader-2"></i>در حال بارگذاری...</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- XRAY -->
+  <div class="page" id="page-xray">
+    <div class="topbar">
+      <div><div class="topbar-title"><i class="ti ti-cpu"></i>Xray Core</div></div>
+      <button class="btn btn-primary" onclick="restartXray()"><i class="ti ti-refresh"></i>ریستارت Xray</button>
+    </div>
+    <div class="xray-status-card">
+      <div class="xray-info">
+        <div class="xray-icon"><i class="ti ti-cpu"></i></div>
+        <div>
+          <div class="xray-name">Xray Core</div>
+          <div class="xray-pid" id="xray-pid">در حال بررسی...</div>
+        </div>
+      </div>
+      <div id="xray-pill"></div>
+    </div>
+    <div class="grid2">
+      <div class="card">
+        <div class="card-title"><i class="ti ti-network"></i>پورت‌های فعال</div>
+        <div id="xray-ports"></div>
+      </div>
+      <div class="card">
+        <div class="card-title"><i class="ti ti-code"></i>کانفیگ فعلی Xray</div>
+        <button class="btn btn-outline btn-sm" style="margin-bottom:10px" onclick="loadXrayConfig()"><i class="ti ti-eye"></i>نمایش کانفیگ</button>
+        <pre id="xray-config-view" style="font-size:10px;color:#93c5fd;background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:12px;overflow-x:auto;white-space:pre-wrap;display:none;max-height:360px;overflow-y:auto"></pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- BLOCKED -->
+  <div class="page" id="page-blocked">
+    <div class="topbar">
+      <div><div class="topbar-title"><i class="ti ti-shield-off"></i>IP های بلاک‌شده</div></div>
+    </div>
+    <div class="card" style="margin-bottom:16px">
+      <div class="form-row">
+        <div class="form-group" style="flex:1"><div class="form-label">آدرس IP</div><input class="form-input" id="block-ip-input" placeholder="1.2.3.4" style="width:100%"></div>
+        <button class="btn btn-danger" onclick="blockIP()"><i class="ti ti-shield-plus"></i>بلاک</button>
+      </div>
+      <div id="blocked-list" style="margin-top:8px"></div>
+    </div>
+  </div>
+
+</div><!-- /main -->
+
+<!-- TOAST -->
+<div class="toast" id="toast"></div>
+
+<!-- CREATE MODAL -->
+<div class="modal-overlay" id="create-modal">
+  <div class="modal">
+    <div class="modal-title"><i class="ti ti-plus"></i>ایجاد لینک جدید</div>
+    <div class="form-row">
+      <div class="form-group" style="flex:1"><div class="form-label">نام / برچسب</div><input class="form-input" id="new-label" placeholder="کاربر جدید" style="width:100%"></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group" style="flex:1">
+        <div class="form-label">پروتکل</div>
+        <select class="form-select" id="new-proto" onchange="onProtoChange()" style="width:100%">
+          <option value="vless">VLESS + WS + TLS</option>
+          <option value="trojan">Trojan + WS + TLS</option>
+          <option value="shadowsocks">Shadowsocks</option>
+          <option value="http">HTTP Proxy</option>
+        </select>
+      </div>
+    </div>
+    <div class="form-row" id="ss-method-row" style="display:none">
+      <div class="form-group" style="flex:1">
+        <div class="form-label">رمزنگاری SS</div>
+        <select class="form-select" id="new-ss-method" style="width:100%">
+          <option value="aes-256-gcm">aes-256-gcm</option>
+          <option value="aes-128-gcm">aes-128-gcm</option>
+          <option value="chacha20-poly1305">chacha20-poly1305</option>
+          <option value="2022-blake3-aes-256-gcm">2022-blake3-aes-256-gcm</option>
+        </select>
+      </div>
+    </div>
+    <div class="form-row" id="password-row">
+      <div class="form-group" style="flex:1"><div class="form-label">رمز عبور (اختیاری — تولید خودکار)</div><input class="form-input" id="new-password" placeholder="خودکار" style="width:100%"></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><div class="form-label">حجم (۰=نامحدود)</div><input class="form-input" id="new-limit" type="number" value="0" min="0" style="width:90px"></div>
+      <div class="form-group"><div class="form-label">واحد</div>
+        <select class="form-select" id="new-unit"><option>GB</option><option>MB</option></select>
+      </div>
+      <div class="form-group"><div class="form-label">مدت (روز، ۰=نامحدود)</div><input class="form-input" id="new-expire" type="number" value="0" min="0" style="width:100px"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-outline" onclick="hideCreateModal()">لغو</button>
+      <button class="btn btn-primary" onclick="createLink()"><i class="ti ti-plus"></i>ایجاد لینک</button>
+    </div>
+  </div>
+</div>
+
+<!-- DETAIL MODAL -->
+<div class="modal-overlay" id="detail-modal">
+  <div class="modal">
+    <div class="modal-title"><i class="ti ti-link"></i><span id="detail-title">جزئیات لینک</span></div>
+    <div id="detail-content"></div>
+    <div class="modal-footer"><button class="btn btn-outline" onclick="hideDetailModal()">بستن</button></div>
+  </div>
+</div>
+
+<script>
+let allLinks=[];
+
+// ── Navigation ──
+function showPage(name){
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
+  document.getElementById('page-'+name).classList.add('active');
+  document.querySelector(`.nav-item[onclick="showPage('${name}')"]`).classList.add('active');
+  closeSidebar();
+  if(name==='overview') loadStats();
+  if(name==='links') loadLinks();
+  if(name==='xray') loadXrayStatus();
+  if(name==='blocked') loadBlocked();
+}
+function openSidebar(){document.getElementById('sidebar').classList.add('open');document.getElementById('overlay').classList.add('show')}
+function closeSidebar(){document.getElementById('sidebar').classList.remove('open');document.getElementById('overlay').classList.remove('show')}
+
+// ── Toast ──
+function toast(msg,err=false){
+  const t=document.getElementById('toast');
+  t.innerHTML=(err?'<i class="ti ti-alert-circle"></i>':'<i class="ti ti-check"></i>')+msg;
+  t.className='toast show'+(err?' err':'');
+  setTimeout(()=>t.classList.remove('show'),2800);
+}
+
+// ── Logout ──
+async function doLogout(){
+  await fetch('/api/logout',{method:'POST'});
+  location.href='/login';
+}
+
+// ── Stats ──
+async function loadStats(){
+  try{
+    const r=await fetch('/stats');
+    if(!r.ok) return;
+    const d=await r.json();
+    document.getElementById('uptime-text').textContent='آپتایم: '+d.uptime+' · '+d.platform;
+    document.getElementById('m-links').textContent=d.links_count;
+    document.getElementById('m-cpu').textContent=d.cpu_percent+'%';
+    document.getElementById('m-ram').textContent=d.memory_percent+'%';
+    document.getElementById('m-blocked').textContent=d.blocked_ips;
+    const xr=d.xray;
+    let rows=`
+      <div class="status-row"><span class="status-key"><i class="ti ti-brand-xing"></i>Xray</span><span class="status-val">${xr.running?'<span style="color:var(--green-text)">✅ در حال اجرا</span>':'<span style="color:var(--red-text)">❌ متوقف</span>'}</span></div>
+      <div class="status-row"><span class="status-key"><i class="ti ti-cpu"></i>CPU</span><span class="status-val">${d.cpu_percent}%</span></div>
+      <div class="status-row"><span class="status-key"><i class="ti ti-brain"></i>RAM</span><span class="status-val">${d.memory_percent}%</span></div>
+      <div class="status-row"><span class="status-key"><i class="ti ti-clock"></i>آپتایم</span><span class="status-val">${d.uptime}</span></div>
+      <div class="status-row"><span class="status-key"><i class="ti ti-cloud"></i>پلتفرم</span><span class="status-val">${d.platform}</span></div>
+    `;
+    document.getElementById('sys-rows').innerHTML=rows;
+  }catch(e){console.error(e)}
+}
+
+// ── Links ──
+async function loadLinks(){
+  try{
+    const r=await fetch('/api/links');
+    if(!r.ok) return;
+    const d=await r.json();
+    allLinks=d.links;
+    renderLinksTable(allLinks);
+  }catch(e){console.error(e)}
+}
+
+const PROTO_LABELS={vless:'VLESS',trojan:'Trojan',shadowsocks:'SS',http:'HTTP'};
+const PROTO_COLORS={vless:'pill-blue',trojan:'pill-amber',shadowsocks:'pill-green',http:'pill-blue'};
+
+function renderLinksTable(links){
+  const tbody=document.getElementById('links-tbody');
+  if(!links.length){
+    tbody.innerHTML='<tr><td colspan="6"><div class="empty-state"><i class="ti ti-users-minus"></i>هنوز لینکی ایجاد نشده</div></td></tr>';
+    return;
+  }
+  tbody.innerHTML=links.map(l=>{
+    const usedPct=l.limit_bytes>0?Math.min(100,Math.round(l.used_bytes/l.limit_bytes*100)):0;
+    const barColor=usedPct<70?'#6366f1':usedPct<90?'#f0b14a':'#f56565';
+    const usedStr=fmtBytes(l.used_bytes);
+    const limitStr=l.limit_bytes>0?fmtBytes(l.limit_bytes):'♾️';
+    const statusPill=l.active&&!l.is_expired&&!l.quota_exceeded
+      ?'<span class="pill pill-green"><span class="pill-dot"></span>فعال</span>'
+      :l.is_expired?'<span class="pill pill-red"><span class="pill-dot"></span>منقضی</span>'
+      :l.quota_exceeded?'<span class="pill pill-amber"><span class="pill-dot"></span>تمام‌شده</span>'
+      :'<span class="pill pill-red"><span class="pill-dot"></span>غیرفعال</span>';
+    const expStr=l.expires_at?`${Math.max(0,Math.round(l.days_left))} روز`:'♾️';
+    const protoCls=PROTO_COLORS[l.protocol]||'pill-blue';
+    return `<tr>
+      <td style="font-weight:600;max-width:140px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${l.label}</td>
+      <td><span class="proto-badge">${PROTO_LABELS[l.protocol]||l.protocol}</span></td>
+      <td>
+        <div class="usage-bar"><div class="usage-bar-fill" style="width:${usedPct}%;background:${barColor}"></div></div>
+        <div class="usage-text">${usedStr} / ${limitStr}</div>
+      </td>
+      <td>${statusPill}</td>
+      <td style="font-size:11px;color:var(--text-2)">${expStr}</td>
+      <td>
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+          <button class="btn btn-outline btn-sm" onclick='showDetail(${JSON.stringify(l)})'><i class="ti ti-eye"></i></button>
+          <button class="btn btn-outline btn-sm" onclick="toggleLink('${l.uuid}',${!l.active})">${l.active?'<i class="ti ti-player-pause"></i>':'<i class="ti ti-player-play"></i>'}</button>
+          <button class="btn btn-danger btn-sm" onclick="deleteLink('${l.uuid}')"><i class="ti ti-trash"></i></button>
+        </div>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+function fmtBytes(b){
+  if(!b) return '0 B';
+  if(b>=1024**3) return (b/1024**3).toFixed(1)+' GB';
+  if(b>=1024**2) return (b/1024**2).toFixed(1)+' MB';
+  return (b/1024).toFixed(1)+' KB';
+}
+
+// ── Create Link ──
+function showCreateModal(){document.getElementById('create-modal').classList.add('show')}
+function hideCreateModal(){document.getElementById('create-modal').classList.remove('show')}
+function onProtoChange(){
+  const p=document.getElementById('new-proto').value;
+  document.getElementById('ss-method-row').style.display=p==='shadowsocks'?'flex':'none';
+  document.getElementById('password-row').style.display=p==='vless'?'none':'flex';
+}
+
+async function createLink(){
+  const label=document.getElementById('new-label').value.trim()||'لینک جدید';
+  const protocol=document.getElementById('new-proto').value;
+  const password=document.getElementById('new-password').value.trim()||undefined;
+  const ss_method=document.getElementById('new-ss-method').value;
+  const limit_value=parseFloat(document.getElementById('new-limit').value)||0;
+  const limit_unit=document.getElementById('new-unit').value;
+  const expire_days=parseFloat(document.getElementById('new-expire').value)||0;
+  try{
+    const r=await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({label,protocol,password,ss_method,limit_value,limit_unit,expire_days})});
+    if(!r.ok) throw new Error((await r.json()).detail||'خطا');
+    const d=await r.json();
+    toast('لینک ایجاد شد ✅');
+    hideCreateModal();
+    loadLinks();
+    showDetail(d);
+  }catch(e){toast(e.message,true)}
+}
+
+// ── Detail Modal ──
+function showDetail(l){
+  document.getElementById('detail-title').textContent=l.label||'جزئیات لینک';
+  const conn=l.connection||{};
+  let html=`<div style="margin-bottom:14px">
+    <span class="proto-badge" style="font-size:11px;padding:4px 10px">${conn.protocol||l.protocol}</span>
+  </div>
+  <div class="form-group" style="margin-bottom:12px">
+    <div class="form-label">لینک اتصال</div>
+    <div class="conn-box" id="modal-conn-link">${conn.link||'—'}</div>
+    <div style="display:flex;gap:8px">
+      <button class="btn btn-primary btn-sm" onclick="copyModalLink()"><i class="ti ti-copy"></i>کپی</button>
+      ${conn.link&&l.protocol!=='http'?'<button class="btn btn-outline btn-sm" onclick="showQRModal()"><i class="ti ti-qrcode"></i>QR</button>':''}
+      <a href="/sub/${l.uuid}" target="_blank" class="btn btn-outline btn-sm" style="text-decoration:none"><i class="ti ti-external-link"></i>صفحه</a>
+    </div>
+  </div>`;
+  if(conn.server){html+=`<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;font-size:12px">
+    <div><div class="form-label">سرور</div><div style="color:var(--text-1);margin-top:3px">${conn.server}</div></div>
+    <div><div class="form-label">پورت</div><div style="color:var(--text-1);margin-top:3px">${conn.port}</div></div>
+    ${conn.path?`<div><div class="form-label">مسیر WS</div><div style="color:var(--text-1);margin-top:3px">${conn.path}</div></div>`:''}
+    ${conn.username?`<div><div class="form-label">نام کاربری</div><div style="color:var(--text-1);margin-top:3px">${conn.username}</div></div>`:''}
+  </div>`;}
+  document.getElementById('detail-content').innerHTML=html;
+  document.getElementById('detail-modal').classList.add('show');
+}
+function hideDetailModal(){document.getElementById('detail-modal').classList.remove('show')}
+function copyModalLink(){
+  const t=document.getElementById('modal-conn-link').textContent.trim();
+  navigator.clipboard.writeText(t).then(()=>toast('کپی شد ✅'));
+}
+function showQRModal(){
+  const t=document.getElementById('modal-conn-link').textContent.trim();
+  window.open('https://api.qrserver.com/v1/create-qr-code/?size=300x300&data='+encodeURIComponent(t),'_blank');
+}
+
+// ── Toggle / Delete ──
+async function toggleLink(uid,active){
+  try{
+    const r=await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({active})});
+    if(!r.ok) throw new Error('خطا');
+    toast(active?'لینک فعال شد':'لینک غیرفعال شد');
+    loadLinks();
+  }catch(e){toast(e.message,true)}
+}
+async function deleteLink(uid){
+  if(!confirm('مطمئنی؟ این لینک حذف می‌شه و از Xray هم برداشته می‌شه.')) return;
+  try{
+    const r=await fetch('/api/links/'+uid,{method:'DELETE'});
+    if(!r.ok) throw new Error('خطا');
+    toast('لینک حذف شد');
+    loadLinks();
+  }catch(e){toast(e.message,true)}
+}
+
+// ── Xray ──
+async function loadXrayStatus(){
+  try{
+    const r=await fetch('/api/xray/status');
+    const d=await r.json();
+    document.getElementById('xray-pid').textContent=d.running?`PID: ${d.pid} · در حال اجرا`:'متوقف';
+    document.getElementById('xray-pill').innerHTML=d.running
+      ?'<span class="pill pill-green"><span class="pill-dot"></span>Online</span>'
+      :'<span class="pill pill-red"><span class="pill-dot"></span>Offline</span>';
+    const ports=[
+      {label:'VLESS WS',port:10000,proto:'vless'},
+      {label:'Trojan WS',port:10001,proto:'trojan'},
+      {label:'Shadowsocks',port:'10002+',proto:'shadowsocks'},
+      {label:'HTTP Proxy',port:'10003+',proto:'http'},
+    ];
+    document.getElementById('xray-ports').innerHTML=ports.map(p=>`
+      <div class="status-row">
+        <span class="status-key"><i class="ti ti-plug"></i>${p.label}</span>
+        <span class="status-val">${p.port} (داخلی)</span>
+      </div>`).join('');
+  }catch(e){console.error(e)}
+}
+async function loadXrayConfig(){
+  try{
+    const r=await fetch('/api/xray/config');
+    const d=await r.json();
+    const el=document.getElementById('xray-config-view');
+    el.textContent=JSON.stringify(d,null,2);
+    el.style.display='block';
+  }catch(e){toast('خطا در دریافت کانفیگ',true)}
+}
+async function restartXray(){
+  try{
+    const r=await fetch('/api/xray/restart',{method:'POST'});
+    if(!r.ok) throw new Error('خطا');
+    toast('Xray ریستارت شد ✅');
+    loadXrayStatus();
+  }catch(e){toast(e.message,true)}
+}
+
+// ── Blocked ──
+async function loadBlocked(){
+  try{
+    const r=await fetch('/api/blocked');
+    const d=await r.json();
+    const ips=d.blocked_ips||[];
+    document.getElementById('blocked-list').innerHTML=ips.length
+      ?ips.map(ip=>`<div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border);font-size:12.5px">
+          <span style="font-family:ui-monospace,monospace;color:#93c5fd">${ip}</span>
+          <button class="btn btn-danger btn-sm" onclick="unblockIP('${ip}')"><i class="ti ti-shield-check"></i>آنبلاک</button>
+        </div>`).join('')
+      :'<div style="color:var(--text-2);font-size:12px;padding:10px 0">هیچ IP بلاک‌شده‌ای وجود ندارد.</div>';
+  }catch(e){console.error(e)}
+}
+async function blockIP(){
+  const ip=document.getElementById('block-ip-input').value.trim();
+  if(!ip){toast('آدرس IP را وارد کن',true);return;}
+  try{
+    const r=await fetch('/api/blocked',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip})});
+    if(!r.ok) throw new Error('خطا');
+    document.getElementById('block-ip-input').value='';
+    toast('IP بلاک شد');
+    loadBlocked();
+  }catch(e){toast(e.message,true)}
+}
+async function unblockIP(ip){
+  try{
+    const r=await fetch('/api/blocked/'+encodeURIComponent(ip),{method:'DELETE'});
+    if(!r.ok) throw new Error('خطا');
+    toast('IP آنبلاک شد');
+    loadBlocked();
+  }catch(e){toast(e.message,true)}
+}
+
+// ── Init ──
+loadStats();
+setInterval(loadStats,30000);
+</script>
+</body>
+</html>"""
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard(request: Request):
+    if not await is_valid_session(request.cookies.get(SESSION_COOKIE)):
+        return RedirectResponse("/login")
+    return HTMLResponse(content=DASHBOARD_HTML)
+
+if __name__ == "__main__":
+    uvicorn.run("main_xray:app", host="127.0.0.1", port=8000, log_level="info", workers=1)
