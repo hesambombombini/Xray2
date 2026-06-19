@@ -16,14 +16,14 @@ RUN XRAY_VERSION=$(curl -sf https://api.github.com/repos/XTLS/Xray-core/releases
     && chmod +x /usr/local/bin/xray \
     && rm -rf /tmp/xray /tmp/xray.zip
 
-# ───── GeoIP / GeoSite (با fallback) ─────
+# ───── GeoIP (با fallback) ─────
+# توجه: geosite.dat حذف شد چون routing rule‌های فعلی فقط از geoip:private/geoip:cn
+# استفاده می‌کنن، نه از geosite — دانلودش فقط حجم و زمان build رو هدر می‌داد.
 RUN mkdir -p /usr/local/share/xray \
     && (curl -fL https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat \
         -o /usr/local/share/xray/geoip.dat 2>/dev/null \
      || curl -fL https://github.com/v2fly/geoip/releases/latest/download/geoip.dat \
         -o /usr/local/share/xray/geoip.dat) \
-    && curl -fL https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat \
-        -o /usr/local/share/xray/geosite.dat \
     && apt-get purge -y unzip && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/* /tmp/*
 

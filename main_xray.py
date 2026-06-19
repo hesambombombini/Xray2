@@ -170,6 +170,39 @@ def is_link_expired(link: dict) -> bool:
     if not exp: return False
     return datetime.fromisoformat(exp) <= datetime.now()
 
+def get_container_memory_percent() -> float:
+    """درصد واقعی مصرف RAM کانتینر را برمی‌گرداند (بر اساس محدودیت cgroup، نه کل سرور میزبان)."""
+    # cgroup v2
+    try:
+        cur = Path("/sys/fs/cgroup/memory.current")
+        lim = Path("/sys/fs/cgroup/memory.max")
+        if cur.exists() and lim.exists():
+            used = int(cur.read_text().strip())
+            limit_raw = lim.read_text().strip()
+            if limit_raw != "max":
+                limit = int(limit_raw)
+                if limit > 0:
+                    return round(used / limit * 100, 1)
+    except Exception:
+        pass
+    # cgroup v1
+    try:
+        cur = Path("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+        lim = Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+        if cur.exists() and lim.exists():
+            used = int(cur.read_text().strip())
+            limit = int(lim.read_text().strip())
+            # یه محدودیت غیرفعال (خیلی بزرگ) معمولاً یعنی هیچ limit‌ای ست نشده
+            if 0 < limit < (1 << 62):
+                return round(used / limit * 100, 1)
+    except Exception:
+        pass
+    # fallback: حافظه‌ی کل ماشین میزبان (دقیق نیست ولی بهتر از هیچی)
+    try:
+        return psutil.virtual_memory().percent
+    except Exception:
+        return 0.0
+
 def flag(code: str) -> str:
     if not code or len(code) != 2: return "🌐"
     return chr(0x1F1E6 + ord(code[0].upper()) - 65) + chr(0x1F1E6 + ord(code[1].upper()) - 65)
@@ -449,6 +482,12 @@ async def scheduler_loop():
             await reload_xray()
             for label in changed:
                 logger.info(f"⏰ لینک '{label}' منقضی و غیرفعال شد.")
+        # ── پاکسازی session های منقضی (جلوگیری از رشد بی‌رویه‌ی حافظه) ──
+        now = time.time()
+        async with SESSIONS_LOCK:
+            expired = [tok for tok, exp in SESSIONS.items() if exp < now]
+            for tok in expired:
+                SESSIONS.pop(tok, None)
 
 async def traffic_loop():
     """مصرف واقعی هر لینک رو هر ۲ دقیقه از Xray می‌خونه. برای جلوگیری از نوشتن زیاد
@@ -612,7 +651,7 @@ async def get_stats(_=Depends(require_auth)):
         "links_count":      lc,
         "blocked_ips":      len(BLOCKED_IPS),
         "cpu_percent":      psutil.cpu_percent(interval=0.1),
-        "memory_percent":   psutil.virtual_memory().percent,
+        "memory_percent":   get_container_memory_percent(),
         "total_bytes":      stats["total_bytes"],
         "total_requests":   stats["total_requests"],
         "total_errors":     stats["total_errors"],
