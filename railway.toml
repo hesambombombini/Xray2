@@ -3,15 +3,11 @@ builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-# Railway $PORT رو inject می‌کنه؛ entrypoint.sh اون رو به Nginx می‌ده
 healthcheckPath    = "/health"
-healthcheckTimeout = 45
+healthcheckTimeout = 120
 restartPolicyType  = "ON_FAILURE"
-restartPolicyMaxRetries = 3
+restartPolicyMaxRetries = 5
+startCommand = "/entrypoint.sh"
 
 [[volumes]]
-# داده‌های persistent (لینک‌ها، کانفیگ Xray)
 mountPath = "/data"
-
-[[services]]
-name = "tryak-xray"
