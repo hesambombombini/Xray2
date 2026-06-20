@@ -803,7 +803,7 @@ def generate_vless_link(uid: str, host: str, label: str = "tryak") -> str:
     path = "/xray-ws"
     params = {
         "encryption": "none", "security": "tls", "type": "ws",
-        "host": host, "path": path, "sni": host, "fp": "chrome", "alpn": "http/1.1",
+        "host": host, "path": path, "sni": host, "fp": "chrome", "alpn": "h2,http/1.1",
     }
     q = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
     return f"vless://{uid}@{host}:443?{q}#{quote(label)}"
