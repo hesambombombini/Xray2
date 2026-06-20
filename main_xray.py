@@ -1544,23 +1544,6 @@ body{font-family:'Vazirmatn',sans-serif;background:radial-gradient(circle at 15%
 .empty-state{text-align:center;padding:44px 20px;color:var(--text-2)}
 .empty-state i{font-size:40px;color:var(--border);margin-bottom:10px;display:block}
 
-/* CONNECTIONS ACCORDION */
-.conn-card{background:var(--card);border:1px solid var(--border);border-radius:12px;margin-bottom:10px;overflow:hidden}
-.conn-head{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;cursor:pointer;user-select:none;gap:10px}
-.conn-head:hover{background:rgba(255,255,255,.02)}
-.conn-head-left{display:flex;align-items:center;gap:10px;min-width:0}
-.conn-head-label{font-weight:600;font-size:13.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:200px}
-.conn-count{font-size:11px;color:var(--text-2);background:var(--card2);border:1px solid var(--border);border-radius:20px;padding:2px 10px;flex-shrink:0}
-.conn-chevron{font-size:16px;color:var(--text-2);transition:transform .2s;flex-shrink:0}
-.conn-card.open .conn-chevron{transform:rotate(180deg)}
-.conn-body{max-height:0;overflow:hidden;transition:max-height .25s ease}
-.conn-card.open .conn-body{max-height:600px;overflow-y:auto}
-.conn-body-inner{padding:0 16px 14px 16px;border-top:1px solid var(--border)}
-.conn-table{width:100%;border-collapse:collapse;font-size:12px;margin-top:10px}
-.conn-table th{text-align:right;color:var(--text-3);font-size:10.5px;font-weight:500;padding:4px 6px}
-.conn-table td{padding:6px;border-top:1px solid var(--border)}
-.conn-ip{direction:ltr;text-align:right;font-family:ui-monospace,monospace;color:#93c5fd}
-
 /* BADGES / PILLS */
 .pill{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:20px;font-size:10.5px;font-weight:600}
 .pill-green{background:rgba(76,224,144,.1);border:1px solid rgba(76,224,144,.2);color:var(--green-text)}
@@ -1633,7 +1616,6 @@ body{font-family:'Vazirmatn',sans-serif;background:radial-gradient(circle at 15%
     <div class="nav-label">منو</div>
     <div class="nav-item active" onclick="showPage('overview')"><i class="ti ti-layout-dashboard"></i>داشبورد</div>
     <div class="nav-item" onclick="showPage('links')"><i class="ti ti-users"></i>لینک‌ها</div>
-    <div class="nav-item" onclick="showPage('connections')"><i class="ti ti-world"></i>اتصالات فعلی</div>
     <div class="nav-item" onclick="showPage('xray')"><i class="ti ti-cpu"></i>Xray Core</div>
     <div class="nav-item" onclick="showPage('blocked')"><i class="ti ti-shield-off"></i>بلاک‌ها</div>
   </div>
@@ -1691,16 +1673,6 @@ body{font-family:'Vazirmatn',sans-serif;background:radial-gradient(circle at 15%
         <tbody id="links-tbody"><tr><td colspan="6" class="empty-state"><i class="ti ti-loader-2"></i>در حال بارگذاری...</td></tr></tbody>
       </table>
     </div>
-  </div>
-
-  <!-- CONNECTIONS -->
-  <div class="page" id="page-connections">
-    <div class="topbar">
-      <div><div class="topbar-title"><i class="ti ti-world"></i>اتصالات فعلی</div>
-      <div class="topbar-sub">آی‌پی کلاینت‌هایی که به هر لینک وصل شده‌اند</div></div>
-      <button class="btn btn-outline btn-sm" onclick="loadConnections()"><i class="ti ti-refresh"></i>بروزرسانی</button>
-    </div>
-    <div id="connections-list"><div class="card"><div class="empty-state"><i class="ti ti-loader-2"></i>در حال بارگذاری...</div></div></div>
   </div>
 
   <!-- XRAY -->
@@ -1832,7 +1804,6 @@ function showPage(name){
   closeSidebar();
   if(name==='overview') loadStats();
   if(name==='links') loadLinks();
-  if(name==='connections') loadConnections();
   if(name==='xray') loadXrayStatus();
   if(name==='blocked') loadBlocked();
 }
@@ -2135,82 +2106,6 @@ async function unblockIP(ip){
     toast('IP آنبلاک شد');
     loadBlocked();
   }catch(e){toast(e.message,true)}
-}
-
-// ── Connections page ──
-async function loadConnections(){
-  const box=document.getElementById('connections-list');
-  try{
-    const r=await fetch('/api/links');
-    if(!r.ok) throw new Error();
-    const d=await r.json();
-    const links=d.links||[];
-    if(!links.length){
-      box.innerHTML='<div class="card"><div class="empty-state"><i class="ti ti-users-minus"></i>هنوز لینکی ایجاد نشده</div></div>';
-      return;
-    }
-    box.innerHTML=links.map(l=>`
-      <div class="conn-card" id="conn-card-${l.uuid}">
-        <div class="conn-head" onclick="toggleConnCard('${l.uuid}')">
-          <div class="conn-head-left">
-            <i class="ti ti-chevron-down conn-chevron"></i>
-            <span class="conn-head-label">${l.label}</span>
-          </div>
-          <span class="conn-count" id="conn-count-${l.uuid}">—</span>
-        </div>
-        <div class="conn-body" id="conn-body-${l.uuid}">
-          <div class="conn-body-inner" id="conn-body-inner-${l.uuid}" style="color:var(--text-2);font-size:12px;padding-top:10px">در حال بارگذاری...</div>
-        </div>
-      </div>`).join('');
-    // تعداد کلاینت‌های هر لینک رو از قبل (بدون باز بودن آکاردئون) لود می‌کنیم تا روی badge نشون داده بشه
-    links.forEach(l=>loadConnCount(l.uuid));
-  }catch(e){
-    box.innerHTML='<div class="card"><div class="empty-state"><i class="ti ti-alert-triangle"></i>خطا در دریافت اطلاعات</div></div>';
-  }
-}
-const _connLoaded={};
-async function loadConnCount(uid){
-  try{
-    const r=await fetch(`/api/links/${uid}/clients`);
-    if(!r.ok) return;
-    const d=await r.json();
-    const el=document.getElementById('conn-count-'+uid);
-    if(el) el.textContent=d.clients.length+' IP';
-  }catch(e){}
-}
-function toggleConnCard(uid){
-  const card=document.getElementById('conn-card-'+uid);
-  const wasOpen=card.classList.contains('open');
-  card.classList.toggle('open');
-  if(!wasOpen && !_connLoaded[uid]){
-    _connLoaded[uid]=true;
-    loadConnBody(uid);
-  }
-}
-async function loadConnBody(uid){
-  const inner=document.getElementById('conn-body-inner-'+uid);
-  try{
-    const r=await fetch(`/api/links/${uid}/clients`);
-    if(!r.ok) throw new Error();
-    const d=await r.json();
-    const countEl=document.getElementById('conn-count-'+uid);
-    if(countEl) countEl.textContent=d.clients.length+' IP';
-    if(!d.clients.length){
-      inner.innerHTML='<div style="padding-top:6px">هنوز هیچ کلاینتی به این لینک وصل نشده.</div>';
-      return;
-    }
-    inner.innerHTML=`<table class="conn-table">
-      <thead><tr><th>IP</th><th>کشور</th><th>اولین اتصال</th><th>آخرین اتصال</th><th>تعداد</th></tr></thead>
-      <tbody>${d.clients.map(c=>`<tr>
-        <td class="conn-ip">${c.ip}</td>
-        <td>${c.flag||''} ${c.country}</td>
-        <td style="color:var(--text-3)">${c.first_seen?new Date(c.first_seen).toLocaleString('fa-IR'):'-'}</td>
-        <td style="color:var(--text-3)">${c.last_seen?new Date(c.last_seen).toLocaleString('fa-IR'):'-'}</td>
-        <td>${c.hits}</td>
-      </tr>`).join('')}</tbody></table>`;
-  }catch(e){
-    inner.innerHTML='<div style="padding-top:6px;color:var(--red-text)">خطا در دریافت لیست IPها.</div>';
-  }
 }
 
 // ── Init ──
