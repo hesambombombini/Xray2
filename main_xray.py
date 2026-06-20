@@ -80,8 +80,6 @@ CONFIG = {
     # پورت‌های داخلی Xray (روی localhost) — پشت Nginx
     "xray_vless_port":    10000,
     "xray_trojan_port":   10001,
-    "xray_ss_port":       10002,
-    "xray_http_port":     10003,
     "xray_xhttp_port":    10004,
     "xray_api_port":      10085,
     # پورت Reality — این یکی باید مستقیم (نه پشت Nginx) به بیرون اکسپوز بشه
@@ -119,7 +117,7 @@ hourly_traffic: dict = defaultdict(int)
 # (مصرف جدید بین این پول و پول قبلی) که به hourly_traffic اضافه می‌شه.
 _last_usage_snapshot: dict = {}
 
-# لینک‌ها  uid -> {label, protocol, limit_bytes, used_bytes, created_at, expires_at, active, password(trojan/ss), ss_method}
+# لینک‌ها  uid -> {label, protocol, limit_bytes, used_bytes, created_at, expires_at, active, password(trojan)}
 LINKS: dict = {}
 LINKS_LOCK = asyncio.Lock()
 RELOAD_LOCK = asyncio.Lock()
@@ -374,7 +372,7 @@ def link_protocols(link: dict) -> list:
     return [single] if single else ["vless"]
 
 # ───────── Xray Config Generator ─────────
-SUPPORTED_PROTOCOLS = ["vless", "trojan", "shadowsocks", "http", "vless-xhttp", "vless-reality"]
+SUPPORTED_PROTOCOLS = ["vless", "trojan", "vless-xhttp", "vless-reality"]
 
 def build_xray_config() -> dict:
     """کانفیگ کامل Xray را بر اساس LINKS فعلی می‌سازد."""
@@ -483,35 +481,7 @@ def build_xray_config() -> dict:
         logger.warning("⚠️ کلاینت Reality وجود دارد ولی کلید Reality ساخته نشده؛ این inbound نادیده گرفته شد.")
 
 
-    # هر لینک SS یه پورت مجزا می‌خواد — از پورت پایه + index استفاده می‌کنیم
-    ss_links = [(uid, link) for uid, link in LINKS.items()
-                if "shadowsocks" in link_protocols(link) and link.get("active")]
-    for i, (uid, link) in enumerate(ss_links):
-        inbounds.append({
-            "tag": f"ss-in-{i}",
-            "listen": "0.0.0.0",
-            "port": CONFIG["xray_ss_port"] + i,
-            "protocol": "shadowsocks",
-            "settings": {
-                "method":   link.get("ss_method", "aes-256-gcm"),
-                "password": link.get("password", uid[:16]),
-                "network":  "tcp,udp"
-            },
-            "sniffing": {"enabled": True, "destOverride": ["http", "tls"]}
-        })
 
-    # ── HTTP Proxy ──
-    http_links = [(uid, link) for uid, link in LINKS.items()
-                  if "http" in link_protocols(link) and link.get("active")]
-    for i, (uid, link) in enumerate(http_links):
-        accounts = [{"user": uid[:8], "pass": link.get("password", uid[:16])}]
-        inbounds.append({
-            "tag": f"http-in-{i}",
-            "listen": "0.0.0.0",
-            "port": CONFIG["xray_http_port"] + i,
-            "protocol": "http",
-            "settings": {"accounts": accounts, "allowTransparent": False},
-        })
 
     # ── Outbound ──
     outbounds = [
@@ -840,10 +810,6 @@ def generate_trojan_link(password: str, host: str, label: str = "tryak") -> str:
     q = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
     return f"trojan://{quote(password)}@{host}:443?{q}#{quote(label)}"
 
-def generate_ss_link(method: str, password: str, host: str, port: int, label: str = "tryak") -> str:
-    import base64 as b64
-    userinfo = b64.urlsafe_b64encode(f"{method}:{password}".encode()).decode().rstrip("=")
-    return f"ss://{userinfo}@{host}:{port}#{quote(label)}"
 
 def generate_vless_xhttp_link(uid: str, host: str, label: str = "tryak") -> str:
     path = "/xray-xhttp"
@@ -878,21 +844,6 @@ def get_connection_for_protocol(uid: str, link: dict, proto: str, host: str, ind
             "server":   host, "port": 443,
             "path":     "/xray-trojan",
         }
-    elif proto == "shadowsocks":
-        port = CONFIG["xray_ss_port"] + index
-        return {
-            "link":     generate_ss_link(link.get("ss_method", "aes-256-gcm"), link.get("password", uid[:16]), host, port, link.get("label", "tryak")),
-            "protocol": f"Shadowsocks ({link.get('ss_method','aes-256-gcm')})",
-            "server":   host, "port": port,
-        }
-    elif proto == "http":
-        port = CONFIG["xray_http_port"] + index
-        return {
-            "link":     f"http://{uid[:8]}:{link.get('password', uid[:16])}@{host}:{port}",
-            "protocol": "HTTP Proxy",
-            "server":   host, "port": port,
-            "username": uid[:8], "password": link.get("password", uid[:16]),
-        }
     elif proto == "vless-xhttp":
         return {
             "link":     generate_vless_xhttp_link(uid, host, link.get("label", "tryak")),
@@ -912,12 +863,11 @@ def get_connection_for_protocol(uid: str, link: dict, proto: str, host: str, ind
         }
     return {}
 
-def get_link_connections(uid: str, link: dict, host: str, ss_index: int = 0, http_index: int = 0) -> list:
+def get_link_connections(uid: str, link: dict, host: str) -> list:
     """برای همه‌ی پروتکل‌های انتخاب‌شده روی یک لینک (همون uid)، اطلاعات اتصال جدا برمی‌گردونه."""
     conns = []
     for proto in link_protocols(link):
-        idx = ss_index if proto == "shadowsocks" else (http_index if proto == "http" else 0)
-        c = get_connection_for_protocol(uid, link, proto, host, idx)
+        c = get_connection_for_protocol(uid, link, proto, host, 0)
         if c:
             c["proto_key"] = proto
             conns.append(c)
@@ -1084,9 +1034,7 @@ async def create_link(request: Request, _=Depends(require_auth)):
     asyncio.create_task(reload_xray())
 
     host  = _detect_host()
-    ss_idx = sum(1 for l in LINKS.values() if "shadowsocks" in link_protocols(l)) - 1
-    http_idx = sum(1 for l in LINKS.values() if "http" in link_protocols(l)) - 1
-    conns = get_link_connections(uid, new_link, host, max(ss_idx, 0), max(http_idx, 0))
+    conns = get_link_connections(uid, new_link, host)
 
     return {"uuid": uid, "label": label, "protocol": protocols[0], "protocols": protocols,
             "limit_bytes": limit_bytes, "used_bytes": 0, "active": True,
@@ -1098,13 +1046,10 @@ async def list_links(_=Depends(require_auth)):
     host = _detect_host()
     now  = datetime.now()
     result = []
-    ss_index = 0; http_index = 0
     async with LINKS_LOCK:
         for uid, data in LINKS.items():
             protos = link_protocols(data)
-            conns  = get_link_connections(uid, data, host, ss_index, http_index)
-            if "shadowsocks" in protos: ss_index += 1
-            if "http" in protos: http_index += 1
+            conns  = get_link_connections(uid, data, host)
 
             expires_at  = data.get("expires_at")
             is_expired  = False
@@ -1244,16 +1189,15 @@ async def subscription_raw(uid: str):
         raise HTTPException(404, "لینک یافت نشد")
 
     host     = _detect_host()
-    ss_idx   = sum(1 for u, l in LINKS.items() if "shadowsocks" in link_protocols(l) and u < uid)
-    http_idx = sum(1 for u, l in LINKS.items() if "http" in link_protocols(l) and u < uid)
-    conns    = get_link_connections(uid, link, host, ss_idx, http_idx)
+    conns    = get_link_connections(uid, link, host)
 
-    importable = [c["link"] for c in conns if c.get("link", "").startswith(("vless://", "trojan://", "ss://"))]
+    importable = [c["link"] for c in conns if c.get("link", "").startswith(("vless://", "trojan://"))]
     raw_text = "\n".join(importable)
     encoded = base64.b64encode(raw_text.encode()).decode()
     return Response(content=encoded, media_type="text/plain; charset=utf-8")
 
 
+@app.get("/sub/{uid}", response_class=HTMLResponse)
 async def subscription_page(uid: str, request: Request):
     async with LINKS_LOCK:
         link = LINKS.get(uid)
@@ -1264,37 +1208,61 @@ async def subscription_page(uid: str, request: Request):
     protos    = link_protocols(link)
     is_active = link.get("active", False) and not is_link_expired(link)
     label    = link.get("label", "کاربر")
-    used     = fmt_bytes(link.get("used_bytes", 0))
-    limit    = fmt_bytes(link.get("limit_bytes", 0))
     limit_b  = link.get("limit_bytes", 0)
     used_b   = link.get("used_bytes", 0)
+    remaining_b = max(0, limit_b - used_b) if limit_b > 0 else 0
+
+    used_fmt      = fmt_bytes(used_b)
+    limit_fmt     = fmt_bytes(limit_b)
+    remaining_fmt = fmt_bytes(remaining_b) if limit_b > 0 else "نامحدود ♾️"
     pct      = round(used_b / limit_b * 100, 1) if limit_b > 0 else 0
 
-    ss_idx   = sum(1 for u, l in LINKS.items() if "shadowsocks" in link_protocols(l) and u < uid)
-    http_idx = sum(1 for u, l in LINKS.items() if "http" in link_protocols(l) and u < uid)
-    conns    = get_link_connections(uid, link, host, ss_idx, http_idx)
+    conns    = get_link_connections(uid, link, host)
 
     exp = link.get("expires_at")
     never_expire = not exp
     exp_str = datetime.fromisoformat(exp).strftime("%Y/%m/%d") if exp else "—"
     days_left = 0
+    hours_left = 0
     if exp:
-        days_left = max(0, int((datetime.fromisoformat(exp) - datetime.now()).total_seconds() / 86400))
+        total_secs = max(0, (datetime.fromisoformat(exp) - datetime.now()).total_seconds())
+        days_left  = int(total_secs // 86400)
+        hours_left = int((total_secs % 86400) // 3600)
 
     _proto_names = {"vless": "VLESS · WS · TLS", "trojan": "Trojan · WS · TLS",
-                   "vless-xhttp": "VLESS · XHTTP · TLS", "vless-reality": "VLESS · Reality",
-                   "shadowsocks": f"Shadowsocks · {link.get('ss_method','')}", "http": "HTTP Proxy"}
+                   "vless-xhttp": "VLESS · XHTTP · TLS", "vless-reality": "VLESS · Reality"}
     proto_badges_html = "".join(f'<div class="proto-badge">{_proto_names.get(p,p)}</div>' for p in protos)
     proto_badge = " / ".join(_proto_names.get(p, p) for p in protos)
-    bar = "#6366f1" if pct < 70 else ("#f0b14a" if pct < 90 else "#f56565")
+
+    if pct >= 90:
+        bar = "#f56565"
+        bar_glow = "rgba(245,101,101,0.4)"
+    elif pct >= 70:
+        bar = "#f0b14a"
+        bar_glow = "rgba(240,177,74,0.4)"
+    else:
+        bar = "#6366f1"
+        bar_glow = "rgba(99,102,241,0.4)"
+
     status_text = "فعال" if is_active else "غیرفعال"
+
+    time_remaining_html = ""
+    if not never_expire:
+        if days_left > 0:
+            time_remaining_html = f"{days_left} روز و {hours_left} ساعت"
+        elif hours_left > 0:
+            time_remaining_html = f"{hours_left} ساعت"
+        else:
+            time_remaining_html = "منقضی شده"
+    else:
+        time_remaining_html = "♾️ نامحدود"
 
     conn_sections_html = ""
     for i, conn in enumerate(conns):
-        show_qr = conn.get("protocol", "") in ("VLESS + WS + TLS", "Trojan + WS + TLS", "VLESS + XHTTP + TLS", "VLESS + Reality") or conn.get("link", "").startswith(("vless://", "trojan://", "ss://"))
+        show_qr = conn.get("link", "").startswith(("vless://", "trojan://"))
         conn_sections_html += f"""
-    <div class="conn-section" style="margin-top:{0 if i == 0 else 12}px">
-      <div class="conn-label"><i class="ti ti-link"></i> {conn.get('protocol','')}</div>
+    <div class="conn-section" style="margin-top:{12 if i > 0 else 0}px">
+      <div class="conn-label"><i class="ti ti-plug"></i> {conn.get('protocol','')}</div>
       <div class="conn-text" id="conn-link-{i}">{conn.get('link','')}</div>
       <div class="btn-row">
         <button class="btn btn-primary" onclick="copyLink({i})"><i class="ti ti-copy"></i> کپی لینک</button>
@@ -1303,7 +1271,6 @@ async def subscription_page(uid: str, request: Request):
     </div>"""
 
     conn_links_js = ",".join(json.dumps(c.get("link", "")) for c in conns)
-
 
     html = f"""<!DOCTYPE html>
 <html lang="fa" dir="rtl">
@@ -1317,49 +1284,68 @@ async def subscription_page(uid: str, request: Request):
 *{{margin:0;padding:0;box-sizing:border-box}}
 :root{{--accent:#6366f1;--accent2:#4f46e5;--accent-glow:rgba(99,102,241,0.35);--green:#4ce090;--red:#f56565;--amber:#f0b14a;--bg:#0a0e17;--card:#10172a;--card2:#151d33;--border:#1f2940;--text-1:#eef2ff;--text-2:#7b8aab;--text-3:#475370}}
 body{{font-family:'Vazirmatn',sans-serif;background:radial-gradient(circle at 20% 20%,rgba(59,130,246,0.18),transparent 45%),radial-gradient(circle at 80% 80%,rgba(29,78,216,0.15),transparent 45%),var(--bg);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px;color:var(--text-1)}}
-.card{{background:var(--card);border-radius:20px;width:100%;max-width:400px;border:1px solid var(--border);overflow:hidden;box-shadow:0 24px 70px rgba(0,0,0,.55)}}
+.card{{background:var(--card);border-radius:20px;width:100%;max-width:420px;border:1px solid var(--border);overflow:hidden;box-shadow:0 24px 70px rgba(0,0,0,.55)}}
 .card-header{{padding:22px 24px 18px;background:linear-gradient(135deg,rgba(99,102,241,0.15),rgba(29,78,216,0.08));border-bottom:1px solid var(--border)}}
 .logo-row{{display:flex;align-items:center;gap:14px;margin-bottom:16px}}
-.logo-icon{{font-size:48px;font-weight:900;color:#6366f1;font-family:'Vazirmatn',sans-serif;line-height:1}}
+.logo-icon{{font-size:46px;font-weight:900;color:#6366f1;font-family:'Vazirmatn',sans-serif;line-height:1}}
 .logo-text .name{{font-size:17px;font-weight:800;color:#fff}}
 .logo-text .sub{{font-size:11px;color:rgba(147,197,253,0.8);margin-top:2px}}
 .user-section{{display:flex;align-items:center;gap:12px}}
-.avatar{{width:42px;height:42px;border-radius:50%;background:rgba(59,130,246,0.18);border:2px solid rgba(59,130,246,0.3);display:flex;align-items:center;justify-content:center;font-size:19px}}
+.avatar{{width:44px;height:44px;border-radius:50%;background:rgba(99,102,241,0.18);border:2px solid rgba(99,102,241,0.3);display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0}}
 .user-name{{font-size:16px;font-weight:700;color:#fff}}
 .user-id{{font-size:10px;color:rgba(147,197,253,0.6);font-family:ui-monospace,monospace;margin-top:2px;word-break:break-all}}
 .status-pill{{display:inline-flex;align-items:center;gap:6px;padding:4px 12px;border-radius:20px;font-size:11px;font-weight:600;background:rgba(76,224,144,0.1);border:1px solid rgba(76,224,144,0.2);color:var(--green);margin-top:8px}}
 .status-pill.inactive{{background:rgba(245,101,101,0.1);border-color:rgba(245,101,101,0.2);color:var(--red)}}
 .status-dot{{width:6px;height:6px;border-radius:50%;background:currentColor;animation:pulse 2s infinite}}
 @keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:.35}}}}
-.card-body{{padding:22px 24px 26px}}
-.stats-grid{{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:20px}}
-.stat-box{{background:var(--card2);border-radius:12px;border:1px solid var(--border);padding:12px 14px}}
-.stat-label{{font-size:10px;color:var(--text-2);font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px}}
-.stat-val{{font-size:19px;font-weight:700;color:var(--text-1)}}
-.stat-unit{{font-size:10.5px;color:var(--text-2);margin-top:2px}}
+.card-body{{padding:20px 22px 26px}}
+
+/* ─── Stats Grid (2×2) ─── */
+.stats-grid{{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:18px}}
+.stat-box{{background:var(--card2);border-radius:13px;border:1px solid var(--border);padding:13px 15px;position:relative;overflow:hidden}}
+.stat-box::before{{content:'';position:absolute;inset:0;background:linear-gradient(135deg,rgba(99,102,241,0.04),transparent);pointer-events:none}}
+.stat-icon{{font-size:18px;color:var(--accent);margin-bottom:6px}}
+.stat-label{{font-size:10px;color:var(--text-2);font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px}}
+.stat-val{{font-size:18px;font-weight:700;color:var(--text-1);line-height:1.2}}
+.stat-unit{{font-size:10px;color:var(--text-2);margin-top:3px}}
+.stat-highlight{{color:var(--accent)}}
+
+/* ─── Progress ─── */
+.usage-section{{margin-bottom:18px}}
 .usage-header{{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px}}
 .usage-title{{font-size:12px;font-weight:600;color:var(--text-2)}}
 .usage-numbers span{{color:var(--text-1);font-weight:700;font-size:12px}}
-.progress-track{{height:9px;border-radius:6px;background:var(--card2);border:1px solid var(--border);overflow:hidden;margin-bottom:4px}}
-.progress-fill{{height:100%;border-radius:6px;transition:width .6s;background:{bar}}}
-.progress-pct{{font-size:10px;color:var(--text-2)}}
-.info-rows{{margin:18px 0}}
+.progress-wrap{{position:relative;height:12px;border-radius:8px;background:var(--card2);border:1px solid var(--border);overflow:hidden;margin-bottom:5px}}
+.progress-fill{{height:100%;border-radius:8px;transition:width .6s;background:linear-gradient(90deg,{bar},{bar_glow});box-shadow:0 0 8px {bar_glow}}}
+.progress-labels{{display:flex;justify-content:space-between;font-size:10px;color:var(--text-2)}}
+
+/* ─── Info Rows ─── */
+.info-rows{{margin-bottom:16px}}
 .info-row{{display:flex;justify-content:space-between;align-items:center;padding:9px 0;border-bottom:1px solid var(--border);font-size:12px}}
 .info-row:last-child{{border-bottom:none}}
 .info-key{{color:var(--text-2);display:flex;align-items:center;gap:7px}}
-.info-key i{{font-size:14px}}
-.info-val{{color:var(--text-1);font-weight:600}}
+.info-key i{{font-size:14px;color:var(--accent)}}
+.info-val{{color:var(--text-1);font-weight:600;text-align:left}}
+
+/* ─── Conn Section ─── */
 .conn-section{{background:var(--card2);border-radius:12px;border:1px solid var(--border);padding:14px}}
 .conn-label{{font-size:11px;font-weight:600;color:var(--text-2);margin-bottom:8px;display:flex;align-items:center;gap:6px}}
 .conn-label i{{font-size:13px;color:var(--accent)}}
-.conn-text{{font-family:ui-monospace,monospace;font-size:9.5px;color:#93c5fd;word-break:break-all;line-height:1.7;background:rgba(0,0,0,.2);border-radius:8px;padding:10px 12px;margin-bottom:10px}}
+.conn-text{{font-family:ui-monospace,monospace;font-size:9.5px;color:#93c5fd;word-break:break-all;line-height:1.7;background:rgba(0,0,0,.25);border-radius:8px;padding:10px 12px;margin-bottom:10px;border:1px solid rgba(99,102,241,0.1)}}
 .btn-row{{display:flex;gap:8px;flex-wrap:wrap}}
 .btn{{font-family:inherit;font-size:12px;font-weight:600;border-radius:9px;padding:9px 14px;cursor:pointer;display:inline-flex;align-items:center;gap:6px;border:none;transition:.15s;flex:1;justify-content:center}}
 .btn-primary{{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;box-shadow:0 2px 10px var(--accent-glow)}}
 .btn-primary:hover{{filter:brightness(1.1)}}
 .btn-outline{{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.12);color:var(--text-1)}}
-.proto-badge{{display:inline-block;font-size:10px;background:rgba(99,102,241,0.12);color:#a5b4fc;border:1px solid rgba(99,102,241,0.2);border-radius:6px;padding:2px 8px;font-weight:600;margin-top:4px}}
-.footer{{text-align:center;font-size:10px;color:var(--text-3);padding-top:16px}}
+.btn-outline:hover{{background:rgba(255,255,255,.08)}}
+.btn-success{{background:rgba(76,224,144,0.12);border:1px solid rgba(76,224,144,0.25);color:var(--green)}}
+.proto-badge{{display:inline-block;font-size:10px;background:rgba(99,102,241,0.12);color:#a5b4fc;border:1px solid rgba(99,102,241,0.2);border-radius:6px;padding:2px 8px;font-weight:600;margin:2px 2px 0 0}}
+.sub-section{{background:rgba(99,102,241,0.06);border-radius:12px;border:1px solid rgba(99,102,241,0.15);padding:14px;margin-bottom:12px}}
+.all-configs-btn{{width:100%;margin-bottom:12px}}
+.divider{{height:1px;background:var(--border);margin:14px 0}}
+.section-title{{font-size:11px;font-weight:700;color:var(--text-2);text-transform:uppercase;letter-spacing:.08em;margin-bottom:12px;display:flex;align-items:center;gap:6px}}
+.section-title i{{color:var(--accent);font-size:14px}}
+.footer{{text-align:center;font-size:10px;color:var(--text-3);padding-top:14px}}
 </style>
 </head>
 <body>
@@ -1374,7 +1360,7 @@ body{{font-family:'Vazirmatn',sans-serif;background:radial-gradient(circle at 20
       <div>
         <div class="user-name">{label}</div>
         <div class="user-id">{uid}</div>
-        <div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:4px">{proto_badges_html}</div>
+        <div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:6px">{proto_badges_html}</div>
         <div class="status-pill{'' if is_active else ' inactive'}">
           <span class="status-dot"></span>{status_text}
         </div>
@@ -1382,57 +1368,92 @@ body{{font-family:'Vazirmatn',sans-serif;background:radial-gradient(circle at 20
     </div>
   </div>
   <div class="card-body">
+
+    <!-- ── Stats ── -->
     <div class="stats-grid">
       <div class="stat-box">
-        <div class="stat-label">کل مصرف</div>
-        <div class="stat-val">{used.split()[0]}</div>
-        <div class="stat-unit">{used.split()[-1] if len(used.split())>1 else ''} / {limit}</div>
+        <div class="stat-icon"><i class="ti ti-database"></i></div>
+        <div class="stat-label">حجم باقی‌مانده</div>
+        <div class="stat-val {'stat-highlight' if limit_b > 0 and remaining_b == 0 else ''}">{remaining_fmt.split()[0] if ' ' in remaining_fmt else remaining_fmt}</div>
+        <div class="stat-unit">{"♾️ نامحدود" if limit_b == 0 else (remaining_fmt.split()[-1] if ' ' in remaining_fmt else '')}</div>
       </div>
       <div class="stat-box">
-        <div class="stat-label">وضعیت سرویس</div>
-        <div class="stat-val" style="font-size:14px;margin-top:4px">{'✅ فعال' if is_active else '❌ غیرفعال'}</div>
+        <div class="stat-icon"><i class="ti ti-clock"></i></div>
+        <div class="stat-label">زمان باقی‌مانده</div>
+        <div class="stat-val" style="font-size:{'15px' if days_left > 0 else '14px'}">{days_left if not never_expire else '♾️'}</div>
+        <div class="stat-unit">{'روز' if not never_expire else 'نامحدود'}{f' و {hours_left} ساعت' if not never_expire and hours_left > 0 else ''}</div>
       </div>
     </div>
-    <div>
+
+    <!-- ── Progress Bar ── -->
+    <div class="usage-section">
       <div class="usage-header">
-        <div class="usage-title">مصرف ترافیک</div>
-        <div class="usage-numbers"><span>{used}</span> از {limit}</div>
+        <div class="usage-title"><i class="ti ti-chart-bar" style="font-size:12px;margin-left:4px"></i>مصرف ترافیک</div>
+        <div class="usage-numbers"><span>{used_fmt}</span> از {limit_fmt}</div>
       </div>
-      <div class="progress-track"><div class="progress-fill" style="width:{pct if limit_b>0 else 0}%"></div></div>
-      <div class="progress-pct">{pct}٪ مصرف شده</div>
+      <div class="progress-wrap">
+        <div class="progress-fill" style="width:{min(pct, 100) if limit_b > 0 else 0}%"></div>
+      </div>
+      <div class="progress-labels">
+        <span>{pct}٪ مصرف شده</span>
+        <span>{remaining_fmt} مانده</span>
+      </div>
     </div>
+
+    <!-- ── Info Rows ── -->
     <div class="info-rows">
-      <div class="info-row"><span class="info-key"><i class="ti ti-calendar"></i> تاریخ انقضا</span><span class="info-val">{'بدون انقضا ♾️' if never_expire else exp_str}</span></div>
-      <div class="info-row"><span class="info-key"><i class="ti ti-clock"></i> روزهای باقی‌مانده</span><span class="info-val">{'♾️ نامحدود' if never_expire else f'{days_left} روز'}</span></div>
-      <div class="info-row"><span class="info-key"><i class="ti ti-server"></i> سرور</span><span class="info-val">{host}</span></div>
-      <div class="info-row"><span class="info-key"><i class="ti ti-shield-lock"></i> پروتکل</span><span class="info-val" style="text-align:left">{proto_badge}</span></div>
+      <div class="info-row">
+        <span class="info-key"><i class="ti ti-calendar"></i> تاریخ انقضا</span>
+        <span class="info-val">{'بدون انقضا ♾️' if never_expire else exp_str}</span>
+      </div>
+      <div class="info-row">
+        <span class="info-key"><i class="ti ti-hourglass"></i> زمان باقی‌مانده</span>
+        <span class="info-val">{time_remaining_html}</span>
+      </div>
+      <div class="info-row">
+        <span class="info-key"><i class="ti ti-server"></i> سرور</span>
+        <span class="info-val" style="font-size:11px">{host}</span>
+      </div>
+      <div class="info-row">
+        <span class="info-key"><i class="ti ti-shield-lock"></i> پروتکل</span>
+        <span class="info-val" style="font-size:11px;text-align:left">{proto_badge}</span>
+      </div>
     </div>
-    <div class="conn-section" style="margin-bottom:12px">
+
+    <!-- ── Sub Link ── -->
+    <div class="sub-section">
       <div class="conn-label"><i class="ti ti-rss"></i> لینک سابسکریپشن (Import خودکار)</div>
       <div class="conn-text" id="sub-link">https://{host}/sub/{uid}/raw</div>
       <div class="btn-row">
         <button class="btn btn-primary" onclick="copySubLink()"><i class="ti ti-copy"></i> کپی لینک ساب</button>
       </div>
     </div>
-    <div class="btn-row" style="margin-bottom:12px">
-      <button class="btn btn-outline" onclick="copyAllConfigs()" style="width:100%"><i class="ti ti-copy"></i> کپی تمام کانفیگ‌ها</button>
-    </div>
+
+    <!-- ── Copy All ── -->
+    <button class="btn btn-outline all-configs-btn" onclick="copyAllConfigs()">
+      <i class="ti ti-copy"></i> کپی تمام کانفیگ‌ها ({len(conns)} کانفیگ)
+    </button>
+
+    <!-- ── Individual Configs ── -->
+    <div class="section-title"><i class="ti ti-plug"></i>کانفیگ‌های اتصال</div>
     {conn_sections_html}
+
     <div class="footer">tryak · Xray Gateway</div>
   </div>
 </div>
 <script>
 const ALL_LINKS=[{conn_links_js}];
 function copyLink(i){{
-  const t=document.getElementById('conn-link-'+(i||0)).textContent.trim();
+  const t=document.getElementById('conn-link-'+i).textContent.trim();
   navigator.clipboard.writeText(t).then(()=>{{
     const b=event.currentTarget;const o=b.innerHTML;
     b.innerHTML='<i class="ti ti-check"></i> کپی شد!';
-    setTimeout(()=>b.innerHTML=o,2000);
+    b.classList.add('btn-success');
+    setTimeout(()=>{{b.innerHTML=o;b.classList.remove('btn-success')}},2000);
   }});
 }}
 function showQR(i){{
-  const t=document.getElementById('conn-link-'+(i||0)).textContent.trim();
+  const t=document.getElementById('conn-link-'+i).textContent.trim();
   window.open('https://api.qrserver.com/v1/create-qr-code/?size=300x300&data='+encodeURIComponent(t),'_blank');
 }}
 function copySubLink(){{
@@ -1440,15 +1461,17 @@ function copySubLink(){{
   navigator.clipboard.writeText(t).then(()=>{{
     const b=event.currentTarget;const o=b.innerHTML;
     b.innerHTML='<i class="ti ti-check"></i> کپی شد!';
-    setTimeout(()=>b.innerHTML=o,2000);
+    b.classList.add('btn-success');
+    setTimeout(()=>{{b.innerHTML=o;b.classList.remove('btn-success')}},2000);
   }});
 }}
 function copyAllConfigs(){{
-  const t=ALL_LINKS.filter(Boolean).join('\n');
+  const t=ALL_LINKS.filter(Boolean).join('\\n');
   navigator.clipboard.writeText(t).then(()=>{{
     const b=event.currentTarget;const o=b.innerHTML;
     b.innerHTML='<i class="ti ti-check"></i> همه کپی شد!';
-    setTimeout(()=>b.innerHTML=o,2000);
+    b.classList.add('btn-success');
+    setTimeout(()=>{{b.innerHTML=o;b.classList.remove('btn-success')}},2500);
   }});
 }}
 </script>
@@ -1859,24 +1882,7 @@ body{font-family:'Vazirmatn',sans-serif;background:radial-gradient(circle at 15%
           <label style="display:flex;align-items:center;gap:5px;font-size:12.5px;background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:6px 10px;cursor:pointer">
             <input type="checkbox" class="new-proto-cb" value="trojan" onchange="onProtoChange()"> Trojan
           </label>
-          <label style="display:flex;align-items:center;gap:5px;font-size:12.5px;background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:6px 10px;cursor:pointer">
-            <input type="checkbox" class="new-proto-cb" value="shadowsocks" onchange="onProtoChange()"> Shadowsocks
-          </label>
-          <label style="display:flex;align-items:center;gap:5px;font-size:12.5px;background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:6px 10px;cursor:pointer">
-            <input type="checkbox" class="new-proto-cb" value="http" onchange="onProtoChange()"> HTTP Proxy
-          </label>
         </div>
-      </div>
-    </div>
-    <div class="form-row" id="ss-method-row" style="display:none">
-      <div class="form-group" style="flex:1">
-        <div class="form-label">رمزنگاری SS</div>
-        <select class="form-select" id="new-ss-method" style="width:100%">
-          <option value="aes-256-gcm">aes-256-gcm</option>
-          <option value="aes-128-gcm">aes-128-gcm</option>
-          <option value="chacha20-poly1305">chacha20-poly1305</option>
-          <option value="2022-blake3-aes-256-gcm">2022-blake3-aes-256-gcm</option>
-        </select>
       </div>
     </div>
     <div class="form-row" id="password-row">
@@ -2052,8 +2058,8 @@ async function loadLinks(){
   }catch(e){console.error(e)}
 }
 
-const PROTO_LABELS={vless:'VLESS',trojan:'Trojan',shadowsocks:'SS',http:'HTTP','vless-xhttp':'XHTTP','vless-reality':'Reality'};
-const PROTO_COLORS={vless:'pill-blue',trojan:'pill-amber',shadowsocks:'pill-green',http:'pill-blue','vless-xhttp':'pill-blue','vless-reality':'pill-green'};
+const PROTO_LABELS={vless:'VLESS',trojan:'Trojan','vless-xhttp':'XHTTP','vless-reality':'Reality'};
+const PROTO_COLORS={vless:'pill-blue',trojan:'pill-amber','vless-xhttp':'pill-blue','vless-reality':'pill-green'};
 
 function renderLinksTable(links){
   const tbody=document.getElementById('links-tbody');
@@ -2109,18 +2115,16 @@ function selectedProtocols(){
 }
 function onProtoChange(){
   const protos=selectedProtocols();
-  document.getElementById('ss-method-row').style.display=protos.includes('shadowsocks')?'flex':'none';
-  document.getElementById('password-row').style.display=protos.some(p=>p!=='vless'&&p!=='vless-xhttp'&&p!=='vless-reality')?'flex':'none';
+  document.getElementById('password-row').style.display=protos.includes('trojan')?'flex':'none';
 }
 
-let _creatingLink=false; // جلوگیری از ارسال دوبار درخواست هنگام کلیک دوتایی روی دکمه ایجاد
+let _creatingLink=false;
 async function createLink(){
-  if(_creatingLink) return;            // اگر درخواست قبلی هنوز در حال پردازشه، نادیده بگیر
+  if(_creatingLink) return;
   const protocols=selectedProtocols();
   if(!protocols.length){ toast('حداقل یک پروتکل را انتخاب کنید',true); return; }
   const label=document.getElementById('new-label').value.trim()||'لینک جدید';
   const password=document.getElementById('new-password').value.trim()||undefined;
-  const ss_method=document.getElementById('new-ss-method').value;
   const limit_value=parseFloat(document.getElementById('new-limit').value)||0;
   const limit_unit=document.getElementById('new-unit').value;
   const expire_days=parseFloat(document.getElementById('new-expire').value)||0;
@@ -2130,7 +2134,7 @@ async function createLink(){
   if(btn){ btn.disabled=true; btn.dataset.orig=btn.innerHTML; btn.innerHTML='<i class="ti ti-loader-2"></i> در حال ایجاد...'; }
   try{
     const r=await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({label,protocols,password,ss_method,limit_value,limit_unit,expire_days})});
+      body:JSON.stringify({label,protocols,password,limit_value,limit_unit,expire_days})});
     if(!r.ok) throw new Error((await r.json()).detail||'خطا');
     const d=await r.json();
     toast('لینک ایجاد شد ✅');
@@ -2221,8 +2225,8 @@ async function loadXrayStatus(){
     const ports=[
       {label:'VLESS WS',port:10000,proto:'vless'},
       {label:'Trojan WS',port:10001,proto:'trojan'},
-      {label:'Shadowsocks',port:'10002+',proto:'shadowsocks'},
-      {label:'HTTP Proxy',port:'10003+',proto:'http'},
+      {label:'VLESS XHTTP',port:10004,proto:'vless-xhttp'},
+      {label:'VLESS Reality',port:'8443',proto:'vless-reality'},
     ];
     document.getElementById('xray-ports').innerHTML=ports.map(p=>`
       <div class="status-row">
