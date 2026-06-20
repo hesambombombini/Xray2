@@ -1197,8 +1197,26 @@ async def subscription_raw(uid: str):
     return Response(content=encoded, media_type="text/plain; charset=utf-8")
 
 
-@app.get("/sub/{uid}/page", response_class=HTMLResponse)
+@app.get("/sub/{uid}")
 async def subscription_page(uid: str, request: Request):
+    # کلاینت‌های VPN (v2rayNG، Nekobox، ویتوری، clash و ...) با User-Agent شناسایی میشن
+    # و برای اونا مستقیم raw برمیگردونیم؛ مرورگر انسانی HTML زیبا می‌بینه
+    ua = request.headers.get("user-agent", "").lower()
+    vpn_clients = ("v2ray", "clash", "sing-box", "nekobox", "neko", "hiddify",
+                   "shadowrocket", "quantumult", "surfboard", "streisand",
+                   "python", "go-http", "okhttp", "curl", "wget", "axios")
+    if any(c in ua for c in vpn_clients) or not ua:
+        async with LINKS_LOCK:
+            link_check = LINKS.get(uid)
+        if not link_check:
+            raise HTTPException(404, "لینک یافت نشد")
+        host   = _detect_host()
+        conns  = get_link_connections(uid, link_check, host)
+        importable = [c["link"] for c in conns if c.get("link", "").startswith(("vless://", "trojan://"))]
+        raw_text = "\n".join(importable)
+        encoded = base64.b64encode(raw_text.encode()).decode()
+        return Response(content=encoded, media_type="text/plain; charset=utf-8")
+
     async with LINKS_LOCK:
         link = LINKS.get(uid)
     if not link:
@@ -2165,7 +2183,7 @@ function showDetail(l){
     </div>`;
   });
   html+=`<div style="margin-top:6px">
-    <a href="/sub/${l.uuid}/page" target="_blank" class="btn btn-outline btn-sm" style="text-decoration:none;width:100%;justify-content:center"><i class="ti ti-external-link"></i>صفحه اشتراک (همه‌ی پروتکل‌ها)</a>
+    <a href="/sub/${l.uuid}" target="_blank" class="btn btn-outline btn-sm" style="text-decoration:none;width:100%;justify-content:center"><i class="ti ti-external-link"></i>صفحه اشتراک (همه‌ی پروتکل‌ها)</a>
   </div>`;
   document.getElementById('detail-content').innerHTML=html;
   document.getElementById('detail-modal').classList.add('show');
