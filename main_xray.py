@@ -196,10 +196,18 @@ def uptime() -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 def fmt_bytes(b: int) -> str:
+    """برای نمایش limit — صفر یعنی نامحدود"""
     if not b: return "نامحدود ♾️"
     if b >= 1024**3: return f"{b/1024**3:.1f} GB"
     if b >= 1024**2: return f"{b/1024**2:.1f} MB"
     return f"{b/1024:.1f} KB"
+
+def fmt_usage(b: int) -> str:
+    """برای نمایش مصرف واقعی — صفر یعنی 0 نه نامحدود"""
+    if b >= 1024**3: return f"{b/1024**3:.1f} GB"
+    if b >= 1024**2: return f"{b/1024**2:.1f} MB"
+    if b >= 1024: return f"{b/1024:.1f} KB"
+    return "0.0 MB"
 
 def parse_size_to_bytes(value: float, unit: str) -> int:
     u = unit.upper()
@@ -1224,9 +1232,9 @@ async def subscription_page(uid: str, request: Request):
     used_b   = link.get("used_bytes", 0)
     remaining_b = max(0, limit_b - used_b) if limit_b > 0 else 0
 
-    used_fmt      = fmt_bytes(used_b)
+    used_fmt      = fmt_usage(used_b)
     limit_fmt     = fmt_bytes(limit_b)
-    remaining_fmt = fmt_bytes(remaining_b) if limit_b > 0 else "نامحدود ♾️"
+    remaining_fmt = fmt_usage(remaining_b) if limit_b > 0 else "نامحدود ♾️"
     pct      = round(used_b / limit_b * 100, 1) if limit_b > 0 else 0
 
     conns    = get_link_connections(uid, link, host)
