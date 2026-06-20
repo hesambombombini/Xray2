@@ -4,7 +4,6 @@ import os
 import hashlib
 import secrets
 import time
-import subprocess
 import signal
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -102,7 +101,7 @@ XRAY_BIN   = Path(os.environ.get("XRAY_BIN", "/usr/local/bin/xray"))
 
 # ───────── State ─────────
 http_client: httpx.AsyncClient | None = None
-xray_process: subprocess.Popen | None = None
+xray_process: "asyncio.subprocess.Process | None" = None
 keepalive_task: asyncio.Task | None  = None
 scheduler_task: asyncio.Task | None  = None
 traffic_task: asyncio.Task | None    = None
@@ -133,8 +132,10 @@ LINK_CLIENTS_LOCK = asyncio.Lock()
 
 _ip_geo_cache: dict = {}          # ip -> {"country","country_code","city"}
 _IP_GEO_CACHE_MAX = 5000
-_access_log_task: "asyncio.Task | None" = None
-_ACCESS_LOG_PATH = _DATA_DIR / "xray_access.log"
+# دیگه از فایل روی دیسک استفاده نمی‌کنیم؛ خروجی Xray مستقیم از stdout پروسه،
+# به‌صورت stream و event-driven خونده می‌شه (نه polling روی فایل) — هم دیسک
+# درگیر نمی‌شه، هم CPU کمتر مصرف می‌شه چون دیگه هر ۲ ثانیه open/seek نداریم.
+_xray_stdout_task: "asyncio.Task | None" = None
 
 # session
 SESSION_COOKIE = "tryak_xray_session"
@@ -323,37 +324,33 @@ async def _record_client_ip(uid: str, ip: str):
                     entry["country_code"] = info.get("country_code", "")
                     entry["city"] = info.get("city", "")
 
-async def access_log_tailer():
-    """فایل accessLog خروجی Xray رو دنبال می‌کنه (مثل tail -f) و IP/کلاینت‌ها رو استخراج می‌کنه.
-    چون حالا loglevel روی info هست، فایل لاگ پیوسته رشد می‌کنه؛ برای جلوگیری از پر شدن دیسک
-    و کند شدن تدریجی، وقتی به یه سقف مشخص رسید خالی‌ش می‌کنیم (truncate)."""
-    pos = 0
-    _MAX_LOG_BYTES = 20 * 1024 * 1024  # 20MB
-    while True:
-        try:
-            if _ACCESS_LOG_PATH.exists():
-                size = _ACCESS_LOG_PATH.stat().st_size
-                if size < pos:   # فایل rotate/restart شده
-                    pos = 0
-                with open(_ACCESS_LOG_PATH, "r", errors="ignore") as f:
-                    f.seek(pos)
-                    for line in f:
-                        m = _ACCESS_LOG_RE.search(line)
-                        if m:
-                            ip = m.group("ip")
-                            uid = m.group("email")
-                            if uid in LINKS:
-                                asyncio.create_task(_record_client_ip(uid, ip))
-                    pos = f.tell()
-                if pos >= _MAX_LOG_BYTES:
-                    try:
-                        _ACCESS_LOG_PATH.write_text("")
-                        pos = 0
-                    except Exception as e:
-                        logger.warning(f"⚠️ access log truncate error: {e}")
-        except Exception as e:
-            logger.warning(f"⚠️ access log tail error: {e}")
-        await asyncio.sleep(2)
+async def xray_stdout_reader(proc: "asyncio.subprocess.Process"):
+    """خط‌های stdout پروسه‌ی Xray رو همون لحظه که می‌رسن می‌خونه (event-driven، نه polling).
+    دیگه هیچ فایلی روی دیسک نوشته/خونده نمی‌شه؛ هم سبک‌تره هم بدون تاخیر ۲ ثانیه‌ای.
+    خط‌های غیر access (مثل خطاها/هشدارهای خود Xray) رو از طریق logger خودمون پاس می‌ده تا
+    توی لاگ‌های Railway/Docker هم دیده بشن (چون دیگه stdout مستقیم به کانتینر وصل نیست)."""
+    if not proc.stdout:
+        return
+    try:
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            text = line.decode(errors="ignore").rstrip("\n")
+            if not text:
+                continue
+            m = _ACCESS_LOG_RE.search(text)
+            if m:
+                ip = m.group("ip")
+                uid = m.group("email")
+                if uid in LINKS:
+                    asyncio.create_task(_record_client_ip(uid, ip))
+            else:
+                logger.info(f"[xray] {text}")
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.warning(f"⚠️ xray stdout reader error: {e}")
 
 def link_protocols(link: dict) -> list:
     """لیست پروتکل‌های فعال یک لینک. از فیلد جدید protocols (چندتایی) پشتیبانی می‌کند
@@ -526,12 +523,12 @@ def build_xray_config() -> dict:
     return {
         "log": {
             # نکته‌ی مهم: لاگ "accepted ... email: <uid>" که برای ردیابی IP کلاینت‌ها لازمه
-            # توی Xray با سطح severity = Info نوشته می‌شه. وقتی loglevel روی "warning" بود،
-            # این خط‌ها اصلاً تولید نمی‌شدن و فایل access log همیشه خالی می‌موند — برای همینه
-            # که بخش «IPهای متصل» هیچ‌وقت چیزی نشون نمی‌داد، با اینکه تایلر/پارسر/API‌ش
-            # کامل پیاده‌سازی شده بودن. با "info" این مشکل حل می‌شه.
+            # توی Xray با سطح severity = Info نوشته می‌شه؛ پس loglevel باید info باشه.
+            # "access" رو عمداً ست نمی‌کنیم (یا می‌ذاریمش خالی) تا Xray اون رو روی
+            # stdout بنویسه، نه روی یه فایل جدا روی دیسک — برنامه مستقیم از stdout
+            # خود پروسه می‌خونتش (xray_stdout_reader)، پس هیچ I/O دیسکی برای لاگ نداریم.
             "loglevel": "info",
-            "access": str(_ACCESS_LOG_PATH),
+            "access": "",
         },
         "api": {
             "tag":      "api",
@@ -587,24 +584,30 @@ async def start_xray():
 
     await write_xray_config()
 
+    global _xray_stdout_task
+
     # اول پروسه قبلی رو می‌بندیم
-    if xray_process and xray_process.poll() is None:
+    if xray_process and xray_process.returncode is None:
         xray_process.terminate()
         try:
-            await asyncio.to_thread(xray_process.wait, timeout=5)
+            await asyncio.wait_for(xray_process.wait(), timeout=5)
         except Exception:
             xray_process.kill()
+    if _xray_stdout_task:
+        _xray_stdout_task.cancel()
+        _xray_stdout_task = None
 
-    xray_process = subprocess.Popen(
-        [str(XRAY_BIN), "run", "-c", str(_XRAY_CONFIG_PATH)],
-        stdout=None,
-        stderr=subprocess.STDOUT,
+    xray_process = await asyncio.create_subprocess_exec(
+        str(XRAY_BIN), "run", "-c", str(_XRAY_CONFIG_PATH),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
     )
+    _xray_stdout_task = asyncio.create_task(xray_stdout_reader(xray_process))
     logger.info(f"🚀 Xray started (pid={xray_process.pid})")
 
 async def query_xray_stats() -> dict:
     """مصرف هر کاربر را از Xray API می‌خونه (بدون نیاز به وابستگی جدید، با باینری خود xray)."""
-    if not (xray_process and xray_process.poll() is None):
+    if not (xray_process and xray_process.returncode is None):
         return {}
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -648,7 +651,7 @@ async def reload_xray():
 def xray_status() -> dict:
     if xray_process is None:
         return {"running": False, "pid": None, "uptime": None}
-    if xray_process.poll() is not None:
+    if xray_process.returncode is not None:
         return {"running": False, "pid": xray_process.pid, "uptime": None}
     return {"running": True, "pid": xray_process.pid}
 
@@ -887,26 +890,25 @@ def get_link_connection_info(uid: str, link: dict, host: str, index: int = 0) ->
 # ───────── Lifespan ─────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global http_client, keepalive_task, scheduler_task, traffic_task, _access_log_task
+    global http_client, keepalive_task, scheduler_task, traffic_task
     limits  = httpx.Limits(max_connections=200, max_keepalive_connections=50)
     timeout = httpx.Timeout(30.0, connect=10.0)
     http_client = httpx.AsyncClient(limits=limits, timeout=timeout, follow_redirects=True)
 
     load_data()
     await ensure_reality_keys()
-    await start_xray()
+    await start_xray()   # خودش xray_stdout_reader رو هم استارت می‌کنه
 
     keepalive_task   = asyncio.create_task(keepalive_loop())
     scheduler_task   = asyncio.create_task(scheduler_loop())
     traffic_task     = asyncio.create_task(traffic_loop())
-    _access_log_task = asyncio.create_task(access_log_tailer())
 
     logger.info(f"🚀 tryak-Xray Gateway started on port {CONFIG['port']}")
     yield
 
-    for t in [keepalive_task, scheduler_task, traffic_task, _access_log_task]:
+    for t in [keepalive_task, scheduler_task, traffic_task, _xray_stdout_task]:
         if t: t.cancel()
-    if xray_process and xray_process.poll() is None:
+    if xray_process and xray_process.returncode is None:
         xray_process.terminate()
     await save_data()
     if http_client:
