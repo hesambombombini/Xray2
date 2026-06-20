@@ -1197,12 +1197,8 @@ async def subscription_raw(uid: str):
     return Response(content=encoded, media_type="text/plain; charset=utf-8")
 
 
-@app.get("/sub/{uid}")
-async def subscription_page(uid: str):
-    return RedirectResponse(url=f"/sub/{uid}/raw", status_code=302)
-
 @app.get("/sub/{uid}/page", response_class=HTMLResponse)
-async def subscription_page_html(uid: str, request: Request):
+async def subscription_page(uid: str, request: Request):
     async with LINKS_LOCK:
         link = LINKS.get(uid)
     if not link:
@@ -2168,9 +2164,8 @@ function showDetail(l){
       </div>`:''}
     </div>`;
   });
-  html+=`<div style="margin-top:6px;display:flex;flex-direction:column;gap:8px">
-    <a href="/sub/${l.uuid}" target="_blank" class="btn btn-outline btn-sm" style="text-decoration:none;width:100%;justify-content:center"><i class="ti ti-external-link"></i>صفحه اشتراک (همه‌ی پروتکل‌ها)</a>
-    <button class="btn btn-outline btn-sm" onclick="copySubscriptionLink('${l.uuid}')" style="width:100%;justify-content:center"><i class="ti ti-rss"></i>کپی لینک ساب (Import خودکار)</button>
+  html+=`<div style="margin-top:6px">
+    <a href="/sub/${l.uuid}/page" target="_blank" class="btn btn-outline btn-sm" style="text-decoration:none;width:100%;justify-content:center"><i class="ti ti-external-link"></i>صفحه اشتراک (همه‌ی پروتکل‌ها)</a>
   </div>`;
   document.getElementById('detail-content').innerHTML=html;
   document.getElementById('detail-modal').classList.add('show');
