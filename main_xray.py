@@ -114,6 +114,9 @@ stats = {
 }
 error_logs: deque = deque(maxlen=50)
 hourly_traffic: dict = defaultdict(int)
+# آخرین مقدار تجمعی هر کاربر که از Xray API خونده شده — برای محاسبه‌ی دلتا
+# (مصرف جدید بین این پول و پول قبلی) که به hourly_traffic اضافه می‌شه.
+_last_usage_snapshot: dict = {}
 
 # لینک‌ها  uid -> {label, protocol, limit_bytes, used_bytes, created_at, expires_at, active, password(trojan/ss), ss_method}
 LINKS: dict = {}
@@ -638,14 +641,19 @@ async def query_xray_stats() -> dict:
 
 async def capture_traffic_baseline():
     """قبل از ری‌استارت Xray، مصرف فعلی رو به‌عنوان baseline ذخیره می‌کنه تا با ری‌استارت صفر نشه."""
+    global _last_usage_snapshot
     usage = await query_xray_stats()
     if not usage:
+        _last_usage_snapshot = {}
         return
     async with LINKS_LOCK:
         for uid, link in LINKS.items():
             if uid in usage:
                 link["baseline_bytes"] = link.get("baseline_bytes", 0) + usage[uid]
                 link["used_bytes"] = link["baseline_bytes"]
+    # بعد از ری‌استارت Xray شمارنده‌های API از صفر شروع می‌شن؛ snapshot رو پاک می‌کنیم
+    # تا دور بعدی traffic_loop به‌جای محاسبه‌ی دلتای منفی، از صفر دلتا بگیره.
+    _last_usage_snapshot = {}
 
 async def reload_xray():
     """کانفیگ را دوباره می‌نویسد و Xray را restart می‌کند.
@@ -674,6 +682,8 @@ async def save_data():
             }
         async with LINK_CLIENTS_LOCK:
             data["link_clients"] = {k: dict(v) for k, v in link_clients.items()}
+        data["hourly_traffic"] = dict(hourly_traffic)
+        data["total_bytes"]    = stats["total_bytes"]
         tmp = DATA_FILE.with_suffix(".tmp")
         await asyncio.to_thread(tmp.write_text, json.dumps(data, ensure_ascii=False, indent=2))
         tmp.replace(DATA_FILE)
@@ -694,6 +704,8 @@ def load_data():
             saved_reality = data.get("reality") or {}
             if saved_reality.get("private_key"):
                 REALITY.update(saved_reality)
+            hourly_traffic.update(data.get("hourly_traffic") or {})
+            stats["total_bytes"] = data.get("total_bytes", 0)
             logger.info(f"✅ Loaded {len(LINKS)} links")
     except Exception as e:
         logger.error(f"Load error: {e}")
@@ -764,13 +776,35 @@ async def scheduler_loop():
 
 async def traffic_loop():
     """مصرف واقعی هر لینک رو هر ۲ دقیقه از Xray می‌خونه. برای جلوگیری از نوشتن زیاد
-    روی دیسک (و کرش سرور به‌خاطر I/O زیاد)، فقط هر ۱۰ دور یا وقتی سهمیه‌ای تموم بشه ذخیره می‌کنه."""
+    روی دیسک (و کرش سرور به‌خاطر I/O زیاد)، فقط هر ۱۰ دور یا وقتی سهمیه‌ای تموم بشه ذخیره می‌کنه.
+    همچنین دلتای مصرف (نسبت به پول قبلی) رو به‌عنوان ترافیک ساعت جاری در hourly_traffic
+    و مجموع کل در stats['total_bytes'] جمع می‌زنه — این داده برای نمودار «ترافیک امروز» استفاده می‌شه."""
+    global _last_usage_snapshot
     await asyncio.sleep(90)
     poll_count = 0
     while True:
         try:
             usage = await query_xray_stats()
             if usage:
+                # ── محاسبه‌ی دلتا نسبت به پول قبلی (usage از Xray API تجمعیه، نه افزایشی) ──
+                delta_total = 0
+                for uid, val in usage.items():
+                    prev = _last_usage_snapshot.get(uid, val)  # دفعه‌ی اول دلتا صفر در نظر گرفته میشه
+                    if val >= prev:
+                        delta_total += val - prev
+                    # اگه val < prev یعنی Xray ری‌استارت شده و شمارنده‌ها صفر شدن؛ این پول رو نادیده می‌گیریم
+                _last_usage_snapshot = dict(usage)
+                if delta_total > 0:
+                    hour_key = datetime.now().strftime("%Y-%m-%d-%H")
+                    hourly_traffic[hour_key] += delta_total
+                    stats["total_bytes"] += delta_total
+                    # حذف باکت‌های قدیمی‌تر از ۴۸ ساعت برای جلوگیری از رشد بی‌رویه‌ی حافظه/فایل
+                    cutoff = datetime.now() - timedelta(hours=48)
+                    old_keys = [k for k in hourly_traffic
+                                if k < cutoff.strftime("%Y-%m-%d-%H")]
+                    for k in old_keys:
+                        hourly_traffic.pop(k, None)
+
                 quota_hit = []
                 async with LINKS_LOCK:
                     for uid, link in LINKS.items():
@@ -984,6 +1018,20 @@ async def get_stats(_=Depends(require_auth)):
         "recent_errors":    list(error_logs)[-10:],
         "hourly":           dict(hourly_traffic),
     }
+
+@app.get("/api/traffic/today")
+async def get_traffic_today(_=Depends(require_auth)):
+    """ترافیک امروز (از ساعت ۰۰:۰۰ تا الان) به تفکیک ساعت، برای رسم نمودار.
+    خروجی همیشه ۲۴ نقطه (ساعت ۰ تا ۲۳) داره؛ ساعت‌های آینده/بدون داده مقدار صفر دارن."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    points = []
+    total_today = 0
+    for h in range(24):
+        key = f"{today}-{h:02d}"
+        val = hourly_traffic.get(key, 0)
+        total_today += val
+        points.append({"hour": h, "bytes": val})
+    return {"date": today, "points": points, "total_bytes": total_today}
 
 # ───────── Link Management ─────────
 @app.post("/api/links")
@@ -1544,6 +1592,14 @@ body{font-family:'Vazirmatn',sans-serif;background:radial-gradient(circle at 15%
 .empty-state{text-align:center;padding:44px 20px;color:var(--text-2)}
 .empty-state i{font-size:40px;color:var(--border);margin-bottom:10px;display:block}
 
+/* OVERVIEW CLIENTS LIST */
+.ov-client-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 4px;border-top:1px solid var(--border)}
+.ov-client-row:first-child{border-top:none}
+.ov-client-left{display:flex;align-items:center;gap:8px;min-width:0}
+.ov-client-name{font-weight:600;font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:160px}
+.ov-client-meta{font-size:10.5px;color:var(--text-2);white-space:nowrap}
+.ov-client-right{display:flex;align-items:center;gap:8px;flex-shrink:0}
+
 /* BADGES / PILLS */
 .pill{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:20px;font-size:10.5px;font-weight:600}
 .pill-green{background:rgba(76,224,144,.1);border:1px solid rgba(76,224,144,.2);color:var(--green-text)}
@@ -1652,8 +1708,14 @@ body{font-family:'Vazirmatn',sans-serif;background:radial-gradient(circle at 15%
       </div>
       <div class="card">
         <div class="card-title"><i class="ti ti-chart-bar"></i>ترافیک امروز</div>
-        <div id="chart-today" style="color:var(--text-2);font-size:12px;padding:20px 0;text-align:center">—</div>
+        <div id="chart-today-total" style="font-size:22px;font-weight:700;margin:4px 0 14px">—</div>
+        <div id="chart-today"><div style="color:var(--text-2);font-size:12px;padding:20px 0;text-align:center">در حال بارگذاری...</div></div>
       </div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <div class="card-title"><i class="ti ti-users"></i>کلاینت‌های ساخته‌شده</div>
+      <div id="overview-clients-list" style="margin-top:6px"><div style="color:var(--text-2);font-size:12px;padding:14px 0;text-align:center">در حال بارگذاری...</div></div>
     </div>
   </div>
 
@@ -1845,6 +1907,87 @@ async function loadStats(){
     `;
     document.getElementById('sys-rows').innerHTML=rows;
   }catch(e){console.error(e)}
+  loadTrafficChart();
+  loadOverviewClients();
+}
+
+// ── Traffic chart (امروز) ──
+async function loadTrafficChart(){
+  const totalEl=document.getElementById('chart-today-total');
+  const box=document.getElementById('chart-today');
+  try{
+    const r=await fetch('/api/traffic/today');
+    if(!r.ok) throw new Error();
+    const d=await r.json();
+    totalEl.textContent=fmtBytes(d.total_bytes)+' امروز';
+    const points=d.points||[];
+    const maxVal=Math.max(1,...points.map(p=>p.bytes));
+    const nowHour=new Date().getHours();
+    const W=300,H=110,padB=18,padT=4,barGap=2;
+    const barW=(W/24)-barGap;
+    let bars='';
+    points.forEach((p,i)=>{
+      const h=p.bytes>0?Math.max(2,Math.round((p.bytes/maxVal)*(H-padT-padB))):0;
+      const x=i*(W/24)+barGap/2;
+      const y=H-padB-h;
+      const future=p.hour>nowHour;
+      const fill=future?'rgba(255,255,255,.05)':'url(#barGrad)';
+      bars+=`<rect x="${x.toFixed(1)}" y="${y}" width="${barW.toFixed(1)}" height="${h}" rx="2" fill="${fill}">
+        <title>${String(p.hour).padStart(2,'0')}:00 — ${fmtBytes(p.bytes)}</title>
+      </rect>`;
+    });
+    const labelEvery=4;
+    let labels='';
+    points.forEach((p,i)=>{
+      if(p.hour%labelEvery===0){
+        const x=i*(W/24)+(W/24)/2;
+        labels+=`<text x="${x.toFixed(1)}" y="${H-4}" font-size="7" fill="var(--text-3)" text-anchor="middle">${String(p.hour).padStart(2,'0')}</text>`;
+      }
+    });
+    box.innerHTML=`<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:130px;overflow:visible">
+      <defs><linearGradient id="barGrad" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="#6366f1"/><stop offset="100%" stop-color="#3b82f6"/>
+      </linearGradient></defs>
+      ${bars}${labels}
+    </svg>`;
+  }catch(e){
+    box.innerHTML='<div style="color:var(--text-2);font-size:12px;padding:20px 0;text-align:center">خطا در دریافت ترافیک</div>';
+  }
+}
+
+// ── Overview: clients summary ──
+async function loadOverviewClients(){
+  const box=document.getElementById('overview-clients-list');
+  try{
+    const r=await fetch('/api/links');
+    if(!r.ok) throw new Error();
+    const d=await r.json();
+    const links=d.links||[];
+    if(!links.length){
+      box.innerHTML='<div style="color:var(--text-2);font-size:12px;padding:14px 0;text-align:center">هنوز کلاینتی ساخته نشده</div>';
+      return;
+    }
+    box.innerHTML=links.map(l=>{
+      const statusDot=l.active&&!l.is_expired&&!l.quota_exceeded?'pill-green':'pill-red';
+      const protos=(l.protocols&&l.protocols.length?l.protocols:[l.protocol]);
+      const protoStr=protos.map(p=>PROTO_LABELS[p]||p).join(' · ');
+      return `<div class="ov-client-row">
+        <div class="ov-client-left">
+          <span class="pill ${statusDot}" style="padding:3px 6px"><span class="pill-dot"></span></span>
+          <div>
+            <div class="ov-client-name">${l.label}</div>
+            <div class="ov-client-meta">${protoStr}</div>
+          </div>
+        </div>
+        <div class="ov-client-right">
+          <span class="ov-client-meta">${fmtBytes(l.used_bytes)}</span>
+          <button class="btn btn-outline btn-sm" onclick='showDetail(${JSON.stringify(l)})'><i class="ti ti-eye"></i></button>
+        </div>
+      </div>`;
+    }).join('');
+  }catch(e){
+    box.innerHTML='<div style="color:var(--text-2);font-size:12px;padding:14px 0;text-align:center">خطا در دریافت کلاینت‌ها</div>';
+  }
 }
 
 // ── Links ──
