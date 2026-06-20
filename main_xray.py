@@ -114,11 +114,22 @@ hourly_traffic: dict = defaultdict(int)
 # لینک‌ها  uid -> {label, protocol, limit_bytes, used_bytes, created_at, expires_at, active, password(trojan/ss), ss_method}
 LINKS: dict = {}
 LINKS_LOCK = asyncio.Lock()
+RELOAD_LOCK = asyncio.Lock()
 
 # کلیدهای Reality (یک‌بار ساخته و persist می‌شن تا با ری‌استارت لینک‌های قبلی خراب نشن)
 REALITY: dict = {"private_key": "", "public_key": "", "short_id": ""}
 
 BLOCKED_IPS: set = set()
+
+# ───────── Client IP Tracking (از روی accessLog خود Xray) ─────────
+# uid -> { ip: {"country","country_code","city","first_seen","last_seen","hits"} }
+link_clients: dict = defaultdict(dict)
+LINK_CLIENTS_LOCK = asyncio.Lock()
+
+_ip_geo_cache: dict = {}          # ip -> {"country","country_code","city"}
+_IP_GEO_CACHE_MAX = 5000
+_access_log_task: "asyncio.Task | None" = None
+_ACCESS_LOG_PATH = _DATA_DIR / "xray_access.log"
 
 # session
 SESSION_COOKIE = "tryak_xray_session"
@@ -237,6 +248,108 @@ def flag(code: str) -> str:
     if not code or len(code) != 2: return "🌐"
     return chr(0x1F1E6 + ord(code[0].upper()) - 65) + chr(0x1F1E6 + ord(code[1].upper()) - 65)
 
+_PRIVATE_IP_PREFIXES = ("10.", "127.", "192.168.", "169.254.", "::1", "fc", "fd")
+def _is_private_ip(ip: str) -> bool:
+    if ip.startswith("172."):
+        try:
+            second = int(ip.split(".")[1])
+            if 16 <= second <= 31:
+                return True
+        except Exception:
+            pass
+    return ip.startswith(_PRIVATE_IP_PREFIXES)
+
+async def get_ip_geo(ip: str) -> dict:
+    """geo کش‌شده برای یک IP. روی fail یه dict خالی برمی‌گردونه."""
+    if ip in _ip_geo_cache:
+        return _ip_geo_cache[ip]
+    if _is_private_ip(ip):
+        return {}
+    try:
+        client = http_client or httpx.AsyncClient(timeout=5)
+        r = await client.get(
+            f"http://ip-api.com/json/{ip}?fields=status,country,countryCode,city",
+            timeout=5.0,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("status") == "success":
+                info = {
+                    "country": data.get("country", ""),
+                    "country_code": data.get("countryCode", ""),
+                    "city": data.get("city", ""),
+                }
+                if len(_ip_geo_cache) >= _IP_GEO_CACHE_MAX:
+                    _ip_geo_cache.pop(next(iter(_ip_geo_cache)), None)
+                _ip_geo_cache[ip] = info
+                return info
+    except Exception:
+        pass
+    return {}
+
+# Xray با email روی هر کلاینت، در accessLog خطی شبیه این می‌نویسه:
+# 2024/01/01 12:00:00 from 1.2.3.4:51514 accepted tcp:example.com:443 [vless-in -> direct] email: <uid>
+import re as _re
+_ACCESS_LOG_RE = _re.compile(
+    r"from\s+(?P<ip>[0-9a-fA-F:.]+):\d+\s+accepted.*email:\s*(?P<email>[\w-]+)"
+)
+
+async def _record_client_ip(uid: str, ip: str):
+    now_iso = datetime.now().isoformat()
+    async with LINK_CLIENTS_LOCK:
+        bucket = link_clients[uid]
+        entry = bucket.get(ip)
+        if entry is None:
+            entry = {
+                "country": "", "country_code": "", "city": "",
+                "first_seen": now_iso, "last_seen": now_iso, "hits": 0,
+            }
+            bucket[ip] = entry
+        entry["last_seen"] = now_iso
+        entry["hits"] = entry.get("hits", 0) + 1
+        need_geo = not entry.get("country")
+    if need_geo:
+        info = await get_ip_geo(ip)
+        if info:
+            async with LINK_CLIENTS_LOCK:
+                entry = link_clients.get(uid, {}).get(ip)
+                if entry is not None:
+                    entry["country"] = info.get("country", "")
+                    entry["country_code"] = info.get("country_code", "")
+                    entry["city"] = info.get("city", "")
+
+async def access_log_tailer():
+    """فایل accessLog خروجی Xray رو دنبال می‌کنه (مثل tail -f) و IP/کلاینت‌ها رو استخراج می‌کنه."""
+    pos = 0
+    while True:
+        try:
+            if _ACCESS_LOG_PATH.exists():
+                size = _ACCESS_LOG_PATH.stat().st_size
+                if size < pos:   # فایل rotate/restart شده
+                    pos = 0
+                with open(_ACCESS_LOG_PATH, "r", errors="ignore") as f:
+                    f.seek(pos)
+                    for line in f:
+                        m = _ACCESS_LOG_RE.search(line)
+                        if m:
+                            ip = m.group("ip")
+                            uid = m.group("email")
+                            if uid in LINKS:
+                                asyncio.create_task(_record_client_ip(uid, ip))
+                    pos = f.tell()
+        except Exception as e:
+            logger.warning(f"⚠️ access log tail error: {e}")
+        await asyncio.sleep(2)
+
+def link_protocols(link: dict) -> list:
+    """لیست پروتکل‌های فعال یک لینک. از فیلد جدید protocols (چندتایی) پشتیبانی می‌کند
+    و در صورت نبودش، به فیلد قدیمی protocol (تکی) fallback می‌کند تا داده‌های قبلی خراب نشن."""
+    protos = link.get("protocols")
+    if isinstance(protos, list) and protos:
+        return protos
+    single = link.get("protocol")
+    return [single] if single else ["vless"]
+
 # ───────── Xray Config Generator ─────────
 SUPPORTED_PROTOCOLS = ["vless", "trojan", "shadowsocks", "http", "vless-xhttp", "vless-reality"]
 
@@ -247,7 +360,7 @@ def build_xray_config() -> dict:
     # ── VLESS + WebSocket (پورت داخلی) ──
     vless_clients = []
     for uid, link in LINKS.items():
-        if link.get("protocol") == "vless" and link.get("active"):
+        if "vless" in link_protocols(link) and link.get("active"):
             vless_clients.append({"id": uid, "email": uid})
 
     if vless_clients:
@@ -270,7 +383,7 @@ def build_xray_config() -> dict:
     # ── Trojan + WebSocket ──
     trojan_clients = []
     for uid, link in LINKS.items():
-        if link.get("protocol") == "trojan" and link.get("active"):
+        if "trojan" in link_protocols(link) and link.get("active"):
             trojan_clients.append({
                 "password": link.get("password", uid),
                 "email": uid
@@ -293,7 +406,7 @@ def build_xray_config() -> dict:
     # ── VLESS + XHTTP (پشت Nginx، مسیر /xray-xhttp) ──
     xhttp_clients = []
     for uid, link in LINKS.items():
-        if link.get("protocol") == "vless-xhttp" and link.get("active"):
+        if "vless-xhttp" in link_protocols(link) and link.get("active"):
             xhttp_clients.append({"id": uid, "email": uid})
 
     if xhttp_clients:
@@ -316,7 +429,7 @@ def build_xray_config() -> dict:
     # ── VLESS + Reality (مستقیم، بدون Nginx — به یه TCP Proxy جدا روی Railway نیاز داره) ──
     reality_clients = []
     for uid, link in LINKS.items():
-        if link.get("protocol") == "vless-reality" and link.get("active"):
+        if "vless-reality" in link_protocols(link) and link.get("active"):
             reality_clients.append({"id": uid, "email": uid, "flow": "xtls-rprx-vision"})
 
     if reality_clients and REALITY.get("private_key"):
@@ -349,7 +462,7 @@ def build_xray_config() -> dict:
 
     # هر لینک SS یه پورت مجزا می‌خواد — از پورت پایه + index استفاده می‌کنیم
     ss_links = [(uid, link) for uid, link in LINKS.items()
-                if link.get("protocol") == "shadowsocks" and link.get("active")]
+                if "shadowsocks" in link_protocols(link) and link.get("active")]
     for i, (uid, link) in enumerate(ss_links):
         inbounds.append({
             "tag": f"ss-in-{i}",
@@ -366,7 +479,7 @@ def build_xray_config() -> dict:
 
     # ── HTTP Proxy ──
     http_links = [(uid, link) for uid, link in LINKS.items()
-                  if link.get("protocol") == "http" and link.get("active")]
+                  if "http" in link_protocols(link) and link.get("active")]
     for i, (uid, link) in enumerate(http_links):
         accounts = [{"user": uid[:8], "pass": link.get("password", uid[:16])}]
         inbounds.append({
@@ -397,7 +510,10 @@ def build_xray_config() -> dict:
         logger.warning("⚠️ geoip.dat یافت نشد یا خالیه؛ قوانین routing مبتنی بر geoip غیرفعال شدن.")
 
     return {
-        "log": {"loglevel": "warning"},
+        "log": {
+            "loglevel": "warning",
+            "access": str(_ACCESS_LOG_PATH),
+        },
         "api": {
             "tag":      "api",
             "services": ["HandlerService", "LoggerService", "StatsService"]
@@ -503,9 +619,12 @@ async def capture_traffic_baseline():
 
 async def reload_xray():
     """کانفیگ را دوباره می‌نویسد و Xray را restart می‌کند.
-    توجه: Xray-core از SIGHUP پشتیبانی نمی‌کنه؛ باید کامل restart بشه."""
-    await capture_traffic_baseline()
-    await start_xray()
+    توجه: Xray-core از SIGHUP پشتیبانی نمی‌کنه؛ باید کامل restart بشه.
+    این تابع ممکنه از background task (بدون await در مسیر اصلی درخواست) صدا زده شه؛
+    برای جلوگیری از race بین چند ری‌استارت هم‌زمان، با یک لاک serialize می‌شه."""
+    async with RELOAD_LOCK:
+        await capture_traffic_baseline()
+        await start_xray()
 
 def xray_status() -> dict:
     if xray_process is None:
@@ -523,6 +642,8 @@ async def save_data():
                 "blocked_ips": list(BLOCKED_IPS),
                 "reality":     dict(REALITY),
             }
+        async with LINK_CLIENTS_LOCK:
+            data["link_clients"] = {k: dict(v) for k, v in link_clients.items()}
         tmp = DATA_FILE.with_suffix(".tmp")
         await asyncio.to_thread(tmp.write_text, json.dumps(data, ensure_ascii=False, indent=2))
         tmp.replace(DATA_FILE)
@@ -538,6 +659,8 @@ def load_data():
             LINKS.update(data.get("links", {}))
             BLOCKED_IPS.clear()
             BLOCKED_IPS.update(data.get("blocked_ips", []))
+            for uid, clients in (data.get("link_clients") or {}).items():
+                link_clients[uid].update(clients)
             saved_reality = data.get("reality") or {}
             if saved_reality.get("private_key"):
                 REALITY.update(saved_reality)
@@ -675,8 +798,7 @@ def generate_vless_reality_link(uid: str, host: str, port: int, label: str = "tr
     q = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
     return f"vless://{uid}@{host}:{port}?{q}#{quote(label)}"
 
-def get_link_connection_info(uid: str, link: dict, host: str, index: int = 0) -> dict:
-    proto = link.get("protocol", "vless")
+def get_connection_for_protocol(uid: str, link: dict, proto: str, host: str, index: int = 0) -> dict:
     if proto == "vless":
         return {
             "link":     generate_vless_link(uid, host, link.get("label", "tryak")),
@@ -725,10 +847,28 @@ def get_link_connection_info(uid: str, link: dict, host: str, index: int = 0) ->
         }
     return {}
 
+def get_link_connections(uid: str, link: dict, host: str, ss_index: int = 0, http_index: int = 0) -> list:
+    """برای همه‌ی پروتکل‌های انتخاب‌شده روی یک لینک (همون uid)، اطلاعات اتصال جدا برمی‌گردونه."""
+    conns = []
+    for proto in link_protocols(link):
+        idx = ss_index if proto == "shadowsocks" else (http_index if proto == "http" else 0)
+        c = get_connection_for_protocol(uid, link, proto, host, idx)
+        if c:
+            c["proto_key"] = proto
+            conns.append(c)
+    return conns
+
+def get_link_connection_info(uid: str, link: dict, host: str, index: int = 0) -> dict:
+    """سازگاری روبه‌عقب: اولین اتصال (پروتکل اصلی) لینک رو برمی‌گردونه."""
+    protos = link_protocols(link)
+    if not protos:
+        return {}
+    return get_connection_for_protocol(uid, link, protos[0], host, index)
+
 # ───────── Lifespan ─────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global http_client, keepalive_task, scheduler_task, traffic_task
+    global http_client, keepalive_task, scheduler_task, traffic_task, _access_log_task
     limits  = httpx.Limits(max_connections=200, max_keepalive_connections=50)
     timeout = httpx.Timeout(30.0, connect=10.0)
     http_client = httpx.AsyncClient(limits=limits, timeout=timeout, follow_redirects=True)
@@ -737,14 +877,15 @@ async def lifespan(app: FastAPI):
     await ensure_reality_keys()
     await start_xray()
 
-    keepalive_task = asyncio.create_task(keepalive_loop())
-    scheduler_task = asyncio.create_task(scheduler_loop())
-    traffic_task   = asyncio.create_task(traffic_loop())
+    keepalive_task   = asyncio.create_task(keepalive_loop())
+    scheduler_task   = asyncio.create_task(scheduler_loop())
+    traffic_task     = asyncio.create_task(traffic_loop())
+    _access_log_task = asyncio.create_task(access_log_tailer())
 
     logger.info(f"🚀 tryak-Xray Gateway started on port {CONFIG['port']}")
     yield
 
-    for t in [keepalive_task, scheduler_task, traffic_task]:
+    for t in [keepalive_task, scheduler_task, traffic_task, _access_log_task]:
         if t: t.cancel()
     if xray_process and xray_process.poll() is None:
         xray_process.terminate()
@@ -818,11 +959,19 @@ async def get_stats(_=Depends(require_auth)):
 # ───────── Link Management ─────────
 @app.post("/api/links")
 async def create_link(request: Request, _=Depends(require_auth)):
-    body         = await request.json()
-    label        = (body.get("label") or "لینک جدید").strip()[:60]
-    protocol     = body.get("protocol", "vless")
-    if protocol not in SUPPORTED_PROTOCOLS:
-        raise HTTPException(400, f"پروتکل نامعتبر. مجاز: {SUPPORTED_PROTOCOLS}")
+    body = await request.json()
+    label = (body.get("label") or "لینک جدید").strip()[:60]
+
+    # سازگار با فرانت قدیمی (یک پروتکل) و جدید (چند پروتکل هم‌زمان روی همون uuid)
+    protocols = body.get("protocols")
+    if not isinstance(protocols, list) or not protocols:
+        single = body.get("protocol", "vless")
+        protocols = [single]
+    protocols = list(dict.fromkeys(protocols))  # حذف تکراری، حفظ ترتیب
+    for p in protocols:
+        if p not in SUPPORTED_PROTOCOLS:
+            raise HTTPException(400, f"پروتکل نامعتبر: {p}. مجاز: {SUPPORTED_PROTOCOLS}")
+
     limit_value  = float(body.get("limit_value") or 0)
     limit_unit   = body.get("limit_unit") or "GB"
     expire_days  = float(body.get("expire_days") or 0)
@@ -833,31 +982,38 @@ async def create_link(request: Request, _=Depends(require_auth)):
     expires_at   = (datetime.now() + timedelta(days=expire_days)).isoformat() if expire_days > 0 else None
     uid          = str(_uuid_mod.uuid4())  # همیشه uuid4 تازه
 
+    new_link = {
+        "label":       label,
+        "protocol":    protocols[0],   # سازگاری روبه‌عقب
+        "protocols":   protocols,
+        "limit_bytes": limit_bytes,
+        "used_bytes":  0,
+        "baseline_bytes": 0,
+        "created_at":  datetime.now().isoformat(),
+        "expires_at":  expires_at,
+        "active":      True,
+        "password":    password,
+        "ss_method":   ss_method,
+    }
     async with LINKS_LOCK:
-        LINKS[uid] = {
-            "label":       label,
-            "protocol":    protocol,
-            "limit_bytes": limit_bytes,
-            "used_bytes":  0,
-            "baseline_bytes": 0,
-            "created_at":  datetime.now().isoformat(),
-            "expires_at":  expires_at,
-            "active":      True,
-            "password":    password,
-            "ss_method":   ss_method,
-        }
+        LINKS[uid] = new_link
 
+    # نکته‌ی مهم: قبلاً اینجا reload_xray() (که خود Xray رو ری‌استارت می‌کنه و چند ثانیه طول
+    # می‌کشه) await می‌شد و کلاینت تا اون موقع منتظر می‌ماند. این باعث می‌شد کاربر فکر کنه
+    # درخواست گیر کرده، دکمه رو دوباره بزنه یا صفحه رو رفرش کنه و همون لینک دوبار ساخته شه.
+    # حالا ابتدا داده ذخیره و پاسخ فوراً برگردونده می‌شه، و ری‌استارت Xray در پس‌زمینه انجام می‌شه.
     await save_data()
-    await reload_xray()
+    asyncio.create_task(reload_xray())
 
     host  = _detect_host()
-    idx   = list(LINKS.keys()).index(uid)
-    conn  = get_link_connection_info(uid, LINKS[uid], host, idx)
+    ss_idx = sum(1 for l in LINKS.values() if "shadowsocks" in link_protocols(l)) - 1
+    http_idx = sum(1 for l in LINKS.values() if "http" in link_protocols(l)) - 1
+    conns = get_link_connections(uid, new_link, host, max(ss_idx, 0), max(http_idx, 0))
 
-    return {"uuid": uid, "label": label, "protocol": protocol,
+    return {"uuid": uid, "label": label, "protocol": protocols[0], "protocols": protocols,
             "limit_bytes": limit_bytes, "used_bytes": 0, "active": True,
-            "created_at": LINKS[uid]["created_at"], "expires_at": expires_at,
-            "connection": conn}
+            "created_at": new_link["created_at"], "expires_at": expires_at,
+            "connection": conns[0] if conns else {}, "connections": conns}
 
 @app.get("/api/links")
 async def list_links(_=Depends(require_auth)):
@@ -867,11 +1023,10 @@ async def list_links(_=Depends(require_auth)):
     ss_index = 0; http_index = 0
     async with LINKS_LOCK:
         for uid, data in LINKS.items():
-            proto = data.get("protocol", "vless")
-            idx   = ss_index if proto == "shadowsocks" else (http_index if proto == "http" else 0)
-            conn  = get_link_connection_info(uid, data, host, idx)
-            if proto == "shadowsocks": ss_index += 1
-            if proto == "http": http_index += 1
+            protos = link_protocols(data)
+            conns  = get_link_connections(uid, data, host, ss_index, http_index)
+            if "shadowsocks" in protos: ss_index += 1
+            if "http" in protos: http_index += 1
 
             expires_at  = data.get("expires_at")
             is_expired  = False
@@ -886,7 +1041,8 @@ async def list_links(_=Depends(require_auth)):
             result.append({
                 "uuid":           uid,
                 "label":          data["label"],
-                "protocol":       proto,
+                "protocol":       protos[0],
+                "protocols":      protos,
                 "limit_bytes":    data["limit_bytes"],
                 "used_bytes":     data["used_bytes"],
                 "active":         data["active"],
@@ -895,10 +1051,30 @@ async def list_links(_=Depends(require_auth)):
                 "days_left":      None if days_left is None else round(days_left, 1),
                 "is_expired":     is_expired,
                 "quota_exceeded": quota_exceeded,
-                "connection":     conn,
+                "connection":     conns[0] if conns else {},
+                "connections":    conns,
             })
     result.sort(key=lambda x: x["created_at"], reverse=True)
     return {"links": result}
+
+@app.get("/api/links/{uid}/clients")
+async def get_link_clients(uid: str, _=Depends(require_auth)):
+    async with LINK_CLIENTS_LOCK:
+        clients = dict(link_clients.get(uid, {}))
+    result = []
+    for ip, info in clients.items():
+        result.append({
+            "ip": ip,
+            "country": info.get("country") or "نامشخص",
+            "country_code": info.get("country_code") or "",
+            "flag": flag(info.get("country_code", "")),
+            "city": info.get("city") or "",
+            "first_seen": info.get("first_seen"),
+            "last_seen": info.get("last_seen"),
+            "hits": info.get("hits", 0),
+        })
+    result.sort(key=lambda c: c["last_seen"] or "", reverse=True)
+    return {"clients": result}
 
 @app.patch("/api/links/{uid}")
 async def update_link(uid: str, request: Request, _=Depends(require_auth)):
@@ -909,6 +1085,13 @@ async def update_link(uid: str, request: Request, _=Depends(require_auth)):
         link = LINKS[uid]
         if "active"       in body: link["active"]    = bool(body["active"])
         if "label"        in body: link["label"]     = str(body["label"]).strip()[:60]
+        if "protocols"    in body and isinstance(body["protocols"], list) and body["protocols"]:
+            protos = list(dict.fromkeys(body["protocols"]))
+            for p in protos:
+                if p not in SUPPORTED_PROTOCOLS:
+                    raise HTTPException(400, f"پروتکل نامعتبر: {p}")
+            link["protocols"] = protos
+            link["protocol"]  = protos[0]
         if "limit_value"  in body:
             lv = float(body.get("limit_value") or 0)
             lu = body.get("limit_unit") or "GB"
@@ -923,15 +1106,15 @@ async def update_link(uid: str, request: Request, _=Depends(require_auth)):
         if "ss_method"    in body: link["ss_method"] = str(body["ss_method"])
 
     await save_data()
-    await reload_xray()
+    asyncio.create_task(reload_xray())
     return {"ok": True}
-
-@app.delete("/api/links/{uid}")
 async def delete_link(uid: str, _=Depends(require_auth)):
     async with LINKS_LOCK:
         LINKS.pop(uid, None)
+    async with LINK_CLIENTS_LOCK:
+        link_clients.pop(uid, None)
     await save_data()
-    await reload_xray()
+    asyncio.create_task(reload_xray())
     return {"ok": True}
 
 # ───────── Xray Control ─────────
@@ -979,7 +1162,7 @@ async def subscription_page(uid: str, request: Request):
         raise HTTPException(404, "لینک یافت نشد")
 
     host     = _detect_host()
-    proto    = link.get("protocol", "vless")
+    protos    = link_protocols(link)
     is_active = link.get("active", False) and not is_link_expired(link)
     label    = link.get("label", "کاربر")
     used     = fmt_bytes(link.get("used_bytes", 0))
@@ -988,10 +1171,9 @@ async def subscription_page(uid: str, request: Request):
     used_b   = link.get("used_bytes", 0)
     pct      = round(used_b / limit_b * 100, 1) if limit_b > 0 else 0
 
-    ss_idx   = sum(1 for u, l in LINKS.items() if l.get("protocol") == "shadowsocks" and u < uid)
-    http_idx = sum(1 for u, l in LINKS.items() if l.get("protocol") == "http" and u < uid)
-    idx      = ss_idx if proto == "shadowsocks" else (http_idx if proto == "http" else 0)
-    conn     = get_link_connection_info(uid, link, host, idx)
+    ss_idx   = sum(1 for u, l in LINKS.items() if "shadowsocks" in link_protocols(l) and u < uid)
+    http_idx = sum(1 for u, l in LINKS.items() if "http" in link_protocols(l) and u < uid)
+    conns    = get_link_connections(uid, link, host, ss_idx, http_idx)
 
     exp = link.get("expires_at")
     never_expire = not exp
@@ -1000,11 +1182,27 @@ async def subscription_page(uid: str, request: Request):
     if exp:
         days_left = max(0, int((datetime.fromisoformat(exp) - datetime.now()).total_seconds() / 86400))
 
-    proto_badge = {"vless": "VLESS · WS · TLS", "trojan": "Trojan · WS · TLS",
+    _proto_names = {"vless": "VLESS · WS · TLS", "trojan": "Trojan · WS · TLS",
                    "vless-xhttp": "VLESS · XHTTP · TLS", "vless-reality": "VLESS · Reality",
-                   "shadowsocks": f"Shadowsocks · {link.get('ss_method','')}", "http": "HTTP Proxy"}.get(proto, proto)
+                   "shadowsocks": f"Shadowsocks · {link.get('ss_method','')}", "http": "HTTP Proxy"}
+    proto_badges_html = "".join(f'<div class="proto-badge">{_proto_names.get(p,p)}</div>' for p in protos)
+    proto_badge = " / ".join(_proto_names.get(p, p) for p in protos)
     bar = "#6366f1" if pct < 70 else ("#f0b14a" if pct < 90 else "#f56565")
     status_text = "فعال" if is_active else "غیرفعال"
+
+    conn_sections_html = ""
+    for i, conn in enumerate(conns):
+        show_qr = conn.get("protocol", "") in ("VLESS + WS + TLS", "Trojan + WS + TLS", "VLESS + XHTTP + TLS", "VLESS + Reality") or conn.get("link", "").startswith(("vless://", "trojan://", "ss://"))
+        conn_sections_html += f"""
+    <div class="conn-section" style="margin-top:{0 if i == 0 else 12}px">
+      <div class="conn-label"><i class="ti ti-link"></i> {conn.get('protocol','')}</div>
+      <div class="conn-text" id="conn-link-{i}">{conn.get('link','')}</div>
+      <div class="btn-row">
+        <button class="btn btn-primary" onclick="copyLink({i})"><i class="ti ti-copy"></i> کپی لینک</button>
+        {f'<button class="btn btn-outline" onclick="showQR({i})"><i class="ti ti-qrcode"></i> QR</button>' if show_qr else ''}
+      </div>
+    </div>"""
+
 
     html = f"""<!DOCTYPE html>
 <html lang="fa" dir="rtl">
@@ -1075,7 +1273,7 @@ body{{font-family:'Vazirmatn',sans-serif;background:radial-gradient(circle at 20
       <div>
         <div class="user-name">{label}</div>
         <div class="user-id">{uid}</div>
-        <div class="proto-badge">{proto_badge}</div>
+        <div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:4px">{proto_badges_html}</div>
         <div class="status-pill{'' if is_active else ' inactive'}">
           <span class="status-dot"></span>{status_text}
         </div>
@@ -1106,30 +1304,23 @@ body{{font-family:'Vazirmatn',sans-serif;background:radial-gradient(circle at 20
       <div class="info-row"><span class="info-key"><i class="ti ti-calendar"></i> تاریخ انقضا</span><span class="info-val">{'بدون انقضا ♾️' if never_expire else exp_str}</span></div>
       <div class="info-row"><span class="info-key"><i class="ti ti-clock"></i> روزهای باقی‌مانده</span><span class="info-val">{'♾️ نامحدود' if never_expire else f'{days_left} روز'}</span></div>
       <div class="info-row"><span class="info-key"><i class="ti ti-server"></i> سرور</span><span class="info-val">{host}</span></div>
-      <div class="info-row"><span class="info-key"><i class="ti ti-shield-lock"></i> پروتکل</span><span class="info-val">{proto_badge}</span></div>
+      <div class="info-row"><span class="info-key"><i class="ti ti-shield-lock"></i> پروتکل</span><span class="info-val" style="text-align:left">{proto_badge}</span></div>
     </div>
-    <div class="conn-section">
-      <div class="conn-label"><i class="ti ti-link"></i> لینک اتصال</div>
-      <div class="conn-text" id="conn-link">{conn.get('link','')}</div>
-      <div class="btn-row">
-        <button class="btn btn-primary" onclick="copyLink()"><i class="ti ti-copy"></i> کپی لینک</button>
-        {'<button class="btn btn-outline" onclick="showQR()"><i class="ti ti-qrcode"></i> QR</button>' if proto in ('vless','trojan','shadowsocks') else ''}
-      </div>
-    </div>
+    {conn_sections_html}
     <div class="footer">tryak · Xray Gateway</div>
   </div>
 </div>
 <script>
-function copyLink(){{
-  const t=document.getElementById('conn-link').textContent.trim();
+function copyLink(i){{
+  const t=document.getElementById('conn-link-'+(i||0)).textContent.trim();
   navigator.clipboard.writeText(t).then(()=>{{
     const b=event.currentTarget;const o=b.innerHTML;
     b.innerHTML='<i class="ti ti-check"></i> کپی شد!';
     setTimeout(()=>b.innerHTML=o,2000);
   }});
 }}
-function showQR(){{
-  const t=document.getElementById('conn-link').textContent.trim();
+function showQR(i){{
+  const t=document.getElementById('conn-link-'+(i||0)).textContent.trim();
   window.open('https://api.qrserver.com/v1/create-qr-code/?size=300x300&data='+encodeURIComponent(t),'_blank');
 }}
 </script>
@@ -1512,15 +1703,27 @@ body{font-family:'Vazirmatn',sans-serif;background:radial-gradient(circle at 15%
     </div>
     <div class="form-row">
       <div class="form-group" style="flex:1">
-        <div class="form-label">پروتکل</div>
-        <select class="form-select" id="new-proto" onchange="onProtoChange()" style="width:100%">
-          <option value="vless">VLESS + WS + TLS</option>
-          <option value="vless-xhttp">VLESS + XHTTP + TLS</option>
-          <option value="vless-reality">VLESS + Reality</option>
-          <option value="trojan">Trojan + WS + TLS</option>
-          <option value="shadowsocks">Shadowsocks</option>
-          <option value="http">HTTP Proxy</option>
-        </select>
+        <div class="form-label">پروتکل (می‌توانید چند مورد را با هم انتخاب کنید)</div>
+        <div id="new-proto-group" style="display:flex;flex-wrap:wrap;gap:8px">
+          <label style="display:flex;align-items:center;gap:5px;font-size:12.5px;background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:6px 10px;cursor:pointer">
+            <input type="checkbox" class="new-proto-cb" value="vless" checked onchange="onProtoChange()"> VLESS+WS
+          </label>
+          <label style="display:flex;align-items:center;gap:5px;font-size:12.5px;background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:6px 10px;cursor:pointer">
+            <input type="checkbox" class="new-proto-cb" value="vless-xhttp" onchange="onProtoChange()"> XHTTP
+          </label>
+          <label style="display:flex;align-items:center;gap:5px;font-size:12.5px;background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:6px 10px;cursor:pointer">
+            <input type="checkbox" class="new-proto-cb" value="vless-reality" onchange="onProtoChange()"> Reality
+          </label>
+          <label style="display:flex;align-items:center;gap:5px;font-size:12.5px;background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:6px 10px;cursor:pointer">
+            <input type="checkbox" class="new-proto-cb" value="trojan" onchange="onProtoChange()"> Trojan
+          </label>
+          <label style="display:flex;align-items:center;gap:5px;font-size:12.5px;background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:6px 10px;cursor:pointer">
+            <input type="checkbox" class="new-proto-cb" value="shadowsocks" onchange="onProtoChange()"> Shadowsocks
+          </label>
+          <label style="display:flex;align-items:center;gap:5px;font-size:12.5px;background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:6px 10px;cursor:pointer">
+            <input type="checkbox" class="new-proto-cb" value="http" onchange="onProtoChange()"> HTTP Proxy
+          </label>
+        </div>
       </div>
     </div>
     <div class="form-row" id="ss-method-row" style="display:none">
@@ -1546,7 +1749,7 @@ body{font-family:'Vazirmatn',sans-serif;background:radial-gradient(circle at 15%
     </div>
     <div class="modal-footer">
       <button class="btn btn-outline" onclick="hideCreateModal()">لغو</button>
-      <button class="btn btn-primary" onclick="createLink()"><i class="ti ti-plus"></i>ایجاد لینک</button>
+      <button class="btn btn-primary" id="create-link-btn" onclick="createLink()"><i class="ti ti-plus"></i>ایجاد لینک</button>
     </div>
   </div>
 </div>
@@ -1626,8 +1829,8 @@ async function loadLinks(){
   }catch(e){console.error(e)}
 }
 
-const PROTO_LABELS={vless:'VLESS',trojan:'Trojan',shadowsocks:'SS',http:'HTTP'};
-const PROTO_COLORS={vless:'pill-blue',trojan:'pill-amber',shadowsocks:'pill-green',http:'pill-blue'};
+const PROTO_LABELS={vless:'VLESS',trojan:'Trojan',shadowsocks:'SS',http:'HTTP','vless-xhttp':'XHTTP','vless-reality':'Reality'};
+const PROTO_COLORS={vless:'pill-blue',trojan:'pill-amber',shadowsocks:'pill-green',http:'pill-blue','vless-xhttp':'pill-blue','vless-reality':'pill-green'};
 
 function renderLinksTable(links){
   const tbody=document.getElementById('links-tbody');
@@ -1646,10 +1849,11 @@ function renderLinksTable(links){
       :l.quota_exceeded?'<span class="pill pill-amber"><span class="pill-dot"></span>تمام‌شده</span>'
       :'<span class="pill pill-red"><span class="pill-dot"></span>غیرفعال</span>';
     const expStr=l.expires_at?`${Math.max(0,Math.round(l.days_left))} روز`:'♾️';
-    const protoCls=PROTO_COLORS[l.protocol]||'pill-blue';
+    const protos=(l.protocols&&l.protocols.length?l.protocols:[l.protocol]);
+    const protoBadges=protos.map(p=>`<span class="proto-badge">${PROTO_LABELS[p]||p}</span>`).join(' ');
     return `<tr>
       <td style="font-weight:600;max-width:140px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${l.label}</td>
-      <td><span class="proto-badge">${PROTO_LABELS[l.protocol]||l.protocol}</span></td>
+      <td><div style="display:flex;gap:4px;flex-wrap:wrap">${protoBadges}</div></td>
       <td>
         <div class="usage-bar"><div class="usage-bar-fill" style="width:${usedPct}%;background:${barColor}"></div></div>
         <div class="usage-text">${usedStr} / ${limitStr}</div>
@@ -1677,64 +1881,108 @@ function fmtBytes(b){
 // ── Create Link ──
 function showCreateModal(){document.getElementById('create-modal').classList.add('show')}
 function hideCreateModal(){document.getElementById('create-modal').classList.remove('show')}
+function selectedProtocols(){
+  return Array.from(document.querySelectorAll('.new-proto-cb:checked')).map(cb=>cb.value);
+}
 function onProtoChange(){
-  const p=document.getElementById('new-proto').value;
-  document.getElementById('ss-method-row').style.display=p==='shadowsocks'?'flex':'none';
-  document.getElementById('password-row').style.display=p==='vless'?'none':'flex';
+  const protos=selectedProtocols();
+  document.getElementById('ss-method-row').style.display=protos.includes('shadowsocks')?'flex':'none';
+  document.getElementById('password-row').style.display=protos.some(p=>p!=='vless'&&p!=='vless-xhttp'&&p!=='vless-reality')?'flex':'none';
 }
 
+let _creatingLink=false; // جلوگیری از ارسال دوبار درخواست هنگام کلیک دوتایی روی دکمه ایجاد
 async function createLink(){
+  if(_creatingLink) return;            // اگر درخواست قبلی هنوز در حال پردازشه، نادیده بگیر
+  const protocols=selectedProtocols();
+  if(!protocols.length){ toast('حداقل یک پروتکل را انتخاب کنید',true); return; }
   const label=document.getElementById('new-label').value.trim()||'لینک جدید';
-  const protocol=document.getElementById('new-proto').value;
   const password=document.getElementById('new-password').value.trim()||undefined;
   const ss_method=document.getElementById('new-ss-method').value;
   const limit_value=parseFloat(document.getElementById('new-limit').value)||0;
   const limit_unit=document.getElementById('new-unit').value;
   const expire_days=parseFloat(document.getElementById('new-expire').value)||0;
+
+  const btn=document.getElementById('create-link-btn');
+  _creatingLink=true;
+  if(btn){ btn.disabled=true; btn.dataset.orig=btn.innerHTML; btn.innerHTML='<i class="ti ti-loader-2"></i> در حال ایجاد...'; }
   try{
     const r=await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({label,protocol,password,ss_method,limit_value,limit_unit,expire_days})});
+      body:JSON.stringify({label,protocols,password,ss_method,limit_value,limit_unit,expire_days})});
     if(!r.ok) throw new Error((await r.json()).detail||'خطا');
     const d=await r.json();
     toast('لینک ایجاد شد ✅');
     hideCreateModal();
-    loadLinks();
+    // به‌جای صرفاً صدا زدن loadLinks() (که نتیجه‌اش ممکنه با تاخیر برسه)، لینک تازه‌ساخته‌شده
+    // را فوری به لیست محلی اضافه می‌کنیم تا بدون نیاز به رفرش صفحه نمایش داده شود.
+    allLinks.unshift(d);
+    renderLinksTable(allLinks);
+    loadLinks(); // هماهنگ‌سازی نهایی با سرور (idempotent، چیزی تکراری اضافه نمی‌کند)
     showDetail(d);
   }catch(e){toast(e.message,true)}
+  finally{
+    _creatingLink=false;
+    if(btn){ btn.disabled=false; btn.innerHTML=btn.dataset.orig||'<i class="ti ti-plus"></i>ایجاد لینک'; }
+  }
 }
 
 // ── Detail Modal ──
 function showDetail(l){
   document.getElementById('detail-title').textContent=l.label||'جزئیات لینک';
-  const conn=l.connection||{};
-  let html=`<div style="margin-bottom:14px">
-    <span class="proto-badge" style="font-size:11px;padding:4px 10px">${conn.protocol||l.protocol}</span>
-  </div>
-  <div class="form-group" style="margin-bottom:12px">
-    <div class="form-label">لینک اتصال</div>
-    <div class="conn-box" id="modal-conn-link">${conn.link||'—'}</div>
-    <div style="display:flex;gap:8px">
-      <button class="btn btn-primary btn-sm" onclick="copyModalLink()"><i class="ti ti-copy"></i>کپی</button>
-      ${conn.link&&l.protocol!=='http'?'<button class="btn btn-outline btn-sm" onclick="showQRModal()"><i class="ti ti-qrcode"></i>QR</button>':''}
-      <a href="/sub/${l.uuid}" target="_blank" class="btn btn-outline btn-sm" style="text-decoration:none"><i class="ti ti-external-link"></i>صفحه</a>
-    </div>
+  const conns=(l.connections&&l.connections.length)?l.connections:[l.connection||{}];
+  let html='';
+  conns.forEach((conn,i)=>{
+    html+=`<div style="margin-bottom:14px;${i>0?'padding-top:14px;border-top:1px solid var(--border)':''}">
+      <div style="margin-bottom:8px"><span class="proto-badge" style="font-size:11px;padding:4px 10px">${conn.protocol||''}</span></div>
+      <div class="conn-box" id="modal-conn-link-${i}">${conn.link||'—'}</div>
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <button class="btn btn-primary btn-sm" onclick="copyModalLink(${i})"><i class="ti ti-copy"></i>کپی</button>
+        ${conn.link&&conn.protocol!=='HTTP Proxy'?`<button class="btn btn-outline btn-sm" onclick="showQRModal(${i})"><i class="ti ti-qrcode"></i>QR</button>`:''}
+      </div>
+      ${conn.server?`<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;font-size:12px;margin-top:10px">
+        <div><div class="form-label">سرور</div><div style="color:var(--text-1);margin-top:3px">${conn.server}</div></div>
+        <div><div class="form-label">پورت</div><div style="color:var(--text-1);margin-top:3px">${conn.port}</div></div>
+        ${conn.path?`<div><div class="form-label">مسیر</div><div style="color:var(--text-1);margin-top:3px">${conn.path}</div></div>`:''}
+        ${conn.username?`<div><div class="form-label">نام کاربری</div><div style="color:var(--text-1);margin-top:3px">${conn.username}</div></div>`:''}
+      </div>`:''}
+    </div>`;
+  });
+  html+=`<div style="margin-top:6px">
+    <a href="/sub/${l.uuid}" target="_blank" class="btn btn-outline btn-sm" style="text-decoration:none;width:100%;justify-content:center"><i class="ti ti-external-link"></i>صفحه اشتراک (همه‌ی پروتکل‌ها)</a>
   </div>`;
-  if(conn.server){html+=`<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;font-size:12px">
-    <div><div class="form-label">سرور</div><div style="color:var(--text-1);margin-top:3px">${conn.server}</div></div>
-    <div><div class="form-label">پورت</div><div style="color:var(--text-1);margin-top:3px">${conn.port}</div></div>
-    ${conn.path?`<div><div class="form-label">مسیر WS</div><div style="color:var(--text-1);margin-top:3px">${conn.path}</div></div>`:''}
-    ${conn.username?`<div><div class="form-label">نام کاربری</div><div style="color:var(--text-1);margin-top:3px">${conn.username}</div></div>`:''}
-  </div>`;}
+  html+=`<div style="margin-top:18px;padding-top:14px;border-top:1px solid var(--border)">
+    <div class="form-label" style="margin-bottom:8px"><i class="ti ti-world"></i> IPهای متصل</div>
+    <div id="modal-clients-list" style="font-size:12px;color:var(--text-2)">در حال بارگذاری...</div>
+  </div>`;
   document.getElementById('detail-content').innerHTML=html;
   document.getElementById('detail-modal').classList.add('show');
+  loadLinkClients(l.uuid);
+}
+async function loadLinkClients(uid){
+  const box=document.getElementById('modal-clients-list');
+  try{
+    const r=await fetch(`/api/links/${uid}/clients`);
+    if(!r.ok) throw new Error();
+    const d=await r.json();
+    if(!d.clients.length){ box.innerHTML='هنوز هیچ کلاینتی به این لینک وصل نشده.'; return; }
+    box.innerHTML=`<table style="width:100%;border-collapse:collapse">
+      <thead><tr style="text-align:right;color:var(--text-3);font-size:10.5px">
+        <th style="padding:4px 0">IP</th><th>کشور</th><th>آخرین اتصال</th><th>تعداد</th>
+      </tr></thead>
+      <tbody>${d.clients.map(c=>`<tr style="border-top:1px solid var(--border)">
+        <td style="padding:5px 0;direction:ltr;text-align:right;font-family:ui-monospace,monospace">${c.ip}</td>
+        <td>${c.flag} ${c.country}</td>
+        <td style="color:var(--text-3)">${c.last_seen?new Date(c.last_seen).toLocaleString('fa-IR'):'-'}</td>
+        <td>${c.hits}</td>
+      </tr>`).join('')}</tbody></table>`;
+  }catch(e){ box.innerHTML='خطا در دریافت لیست IPها.'; }
 }
 function hideDetailModal(){document.getElementById('detail-modal').classList.remove('show')}
-function copyModalLink(){
-  const t=document.getElementById('modal-conn-link').textContent.trim();
+function copyModalLink(i){
+  const t=document.getElementById('modal-conn-link-'+(i||0)).textContent.trim();
   navigator.clipboard.writeText(t).then(()=>toast('کپی شد ✅'));
 }
-function showQRModal(){
-  const t=document.getElementById('modal-conn-link').textContent.trim();
+function showQRModal(i){
+  const t=document.getElementById('modal-conn-link-'+(i||0)).textContent.trim();
   window.open('https://api.qrserver.com/v1/create-qr-code/?size=300x300&data='+encodeURIComponent(t),'_blank');
 }
 
