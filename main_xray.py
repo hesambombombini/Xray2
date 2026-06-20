@@ -24,6 +24,11 @@ import psutil
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("tryak-Xray")
 
+# psutil.cpu_percent با interval=0.1 هر بار event loop رو ۱۰۰ میلی‌ثانیه بلاک می‌کرد
+# (یعنی هیچ درخواست دیگه‌ای توی اون لحظه سرویس‌دهی نمی‌شد). با interval=None یه بار
+# اینجا "prime" می‌کنیم و بعدش هر فراخوانی غیربلاک‌کننده و آنی، نسبت به فراخوانی قبلی، مقدار رو برمی‌گردونه.
+psutil.cpu_percent(interval=None)
+
 # ───────── Platform Detection ─────────
 def _detect_host() -> str:
     for env in ["RAILWAY_PUBLIC_DOMAIN", "RENDER_EXTERNAL_HOSTNAME", "KOYEB_PUBLIC_DOMAIN"]:
@@ -319,8 +324,11 @@ async def _record_client_ip(uid: str, ip: str):
                     entry["city"] = info.get("city", "")
 
 async def access_log_tailer():
-    """فایل accessLog خروجی Xray رو دنبال می‌کنه (مثل tail -f) و IP/کلاینت‌ها رو استخراج می‌کنه."""
+    """فایل accessLog خروجی Xray رو دنبال می‌کنه (مثل tail -f) و IP/کلاینت‌ها رو استخراج می‌کنه.
+    چون حالا loglevel روی info هست، فایل لاگ پیوسته رشد می‌کنه؛ برای جلوگیری از پر شدن دیسک
+    و کند شدن تدریجی، وقتی به یه سقف مشخص رسید خالی‌ش می‌کنیم (truncate)."""
     pos = 0
+    _MAX_LOG_BYTES = 20 * 1024 * 1024  # 20MB
     while True:
         try:
             if _ACCESS_LOG_PATH.exists():
@@ -337,6 +345,12 @@ async def access_log_tailer():
                             if uid in LINKS:
                                 asyncio.create_task(_record_client_ip(uid, ip))
                     pos = f.tell()
+                if pos >= _MAX_LOG_BYTES:
+                    try:
+                        _ACCESS_LOG_PATH.write_text("")
+                        pos = 0
+                    except Exception as e:
+                        logger.warning(f"⚠️ access log truncate error: {e}")
         except Exception as e:
             logger.warning(f"⚠️ access log tail error: {e}")
         await asyncio.sleep(2)
@@ -511,7 +525,12 @@ def build_xray_config() -> dict:
 
     return {
         "log": {
-            "loglevel": "warning",
+            # نکته‌ی مهم: لاگ "accepted ... email: <uid>" که برای ردیابی IP کلاینت‌ها لازمه
+            # توی Xray با سطح severity = Info نوشته می‌شه. وقتی loglevel روی "warning" بود،
+            # این خط‌ها اصلاً تولید نمی‌شدن و فایل access log همیشه خالی می‌موند — برای همینه
+            # که بخش «IPهای متصل» هیچ‌وقت چیزی نشون نمی‌داد، با اینکه تایلر/پارسر/API‌ش
+            # کامل پیاده‌سازی شده بودن. با "info" این مشکل حل می‌شه.
+            "loglevel": "info",
             "access": str(_ACCESS_LOG_PATH),
         },
         "api": {
@@ -947,7 +966,7 @@ async def get_stats(_=Depends(require_auth)):
         "xray":             x,
         "links_count":      lc,
         "blocked_ips":      len(BLOCKED_IPS),
-        "cpu_percent":      psutil.cpu_percent(interval=0.1),
+        "cpu_percent":      psutil.cpu_percent(interval=None),
         "memory_percent":   get_container_memory_percent(),
         "total_bytes":      stats["total_bytes"],
         "total_requests":   stats["total_requests"],
