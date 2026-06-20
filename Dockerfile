@@ -45,6 +45,7 @@ RUN chmod +x /entrypoint.sh
 
 # ───── ENV defaults ─────
 ENV PYTHONUNBUFFERED=1 \
+    PYTHONOPTIMIZE=1 \
     XRAY_LOCATION_ASSET=/usr/local/share/xray \
     XRAY_BIN=/usr/local/bin/xray \
     DATA_DIR=/data

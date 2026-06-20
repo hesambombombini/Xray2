@@ -21,7 +21,7 @@ import httpx
 import logging
 import psutil
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(level=logging.WARNING, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("tryak-Xray")
 
 # psutil.cpu_percent با interval=0.1 هر بار event loop رو ۱۰۰ میلی‌ثانیه بلاک می‌کرد
@@ -133,7 +133,7 @@ link_clients: dict = defaultdict(dict)
 LINK_CLIENTS_LOCK = asyncio.Lock()
 
 _ip_geo_cache: dict = {}          # ip -> {"country","country_code","city"}
-_IP_GEO_CACHE_MAX = 5000
+_IP_GEO_CACHE_MAX = 10000
 # دیگه از فایل روی دیسک استفاده نمی‌کنیم؛ خروجی Xray مستقیم از stdout پروسه،
 # به‌صورت stream و event-driven خونده می‌شه (نه polling روی فایل) — هم دیسک
 # درگیر نمی‌شه، هم CPU کمتر مصرف می‌شه چون دیگه هر ۲ ثانیه open/seek نداریم.
@@ -352,7 +352,7 @@ async def xray_stdout_reader(proc: "asyncio.subprocess.Process"):
                 # IP خالی دارن — این‌ها رو نادیده می‌گیریم، فقط IP واقعی ثبت می‌شه.
                 if ip and uid and uid in LINKS:
                     asyncio.create_task(_record_client_ip(uid, ip))
-            elif text.startswith("[Warning]") or text.startswith("[Error]") or "panic" in text.lower():
+            elif text.startswith("[Error]") or "panic" in text.lower():
                 # فقط خطاها/هشدارهای واقعی Xray رو به لاگ برنامه پاس می‌دیم؛ خط‌های Info
                 # (که با loglevel=info بسیار پرحجم‌اند، مخصوصاً برای UDP) رو دیگه دوباره
                 # از طریق logger پایتون چاپ نمی‌کنیم تا CPU/IO اضافه مصرف نشه.
@@ -509,7 +509,7 @@ def build_xray_config() -> dict:
             # "access" رو عمداً ست نمی‌کنیم (یا می‌ذاریمش خالی) تا Xray اون رو روی
             # stdout بنویسه، نه روی یه فایل جدا روی دیسک — برنامه مستقیم از stdout
             # خود پروسه می‌خونتش (xray_stdout_reader)، پس هیچ I/O دیسکی برای لاگ نداریم.
-            "loglevel": "info",
+            "loglevel": "warning",
             "access": "",
         },
         "api": {
@@ -556,7 +556,6 @@ async def write_xray_config():
     async with LINKS_LOCK:
         cfg = build_xray_config()
     _XRAY_CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2))
-    logger.info(f"✅ Xray config written → {_XRAY_CONFIG_PATH}")
 
 async def start_xray():
     global xray_process
@@ -585,7 +584,6 @@ async def start_xray():
         stderr=asyncio.subprocess.STDOUT,
     )
     _xray_stdout_task = asyncio.create_task(xray_stdout_reader(xray_process))
-    logger.info(f"🚀 Xray started (pid={xray_process.pid})")
 
 async def query_xray_stats() -> dict:
     """مصرف هر کاربر را از Xray API می‌خونه (بدون نیاز به وابستگی جدید، با باینری خود xray)."""
@@ -677,7 +675,6 @@ def load_data():
                 REALITY.update(saved_reality)
             hourly_traffic.update(data.get("hourly_traffic") or {})
             stats["total_bytes"] = data.get("total_bytes", 0)
-            logger.info(f"✅ Loaded {len(LINKS)} links")
     except Exception as e:
         logger.error(f"Load error: {e}")
 
@@ -704,7 +701,6 @@ async def ensure_reality_keys():
             REALITY["public_key"]  = pub
             REALITY["short_id"]    = secrets.token_hex(4)
             await save_data()
-            logger.info("✅ کلیدهای Reality ساخته شد.")
         else:
             logger.warning(f"⚠️ خروجی xray x25519 نامعتبر بود: {text!r}")
     except Exception as e:
@@ -719,7 +715,6 @@ async def keepalive_loop():
             host = _detect_host()
             if host and host != "localhost" and http_client:
                 r = await http_client.get(f"https://{host}/health", timeout=20.0)
-                logger.info(f"🔁 keepalive → {host} [{r.status_code}]")
         except Exception as exc:
             logger.warning(f"⚠️ keepalive failed: {exc}")
         await asyncio.sleep(10 * 60)
@@ -737,7 +732,7 @@ async def scheduler_loop():
             await save_data()
             await reload_xray()
             for label in changed:
-                logger.info(f"⏰ لینک '{label}' منقضی و غیرفعال شد.")
+                logger.warning(f"⏰ لینک '{label}' منقضی و غیرفعال شد.")
         # ── پاکسازی session های منقضی (جلوگیری از رشد بی‌رویه‌ی حافظه) ──
         now = time.time()
         async with SESSIONS_LOCK:
@@ -785,15 +780,15 @@ async def traffic_loop():
                                 link["active"] = False
                                 quota_hit.append(link.get("label", uid[:8]))
                 poll_count += 1
-                if quota_hit or poll_count % 10 == 0:
+                if quota_hit or poll_count % 15 == 0:
                     await save_data()
                 if quota_hit:
                     await reload_xray()
                     for label in quota_hit:
-                        logger.info(f"📊 سهمیه لینک '{label}' تمام شد و غیرفعال شد.")
+                        logger.warning(f"📊 سهمیه لینک '{label}' تمام شد و غیرفعال شد.")
         except Exception as e:
             logger.warning(f"⚠️ traffic loop error: {e}")
-        await asyncio.sleep(30)
+        await asyncio.sleep(60)
 
 # ───────── Link generation helpers ─────────
 def generate_vless_link(uid: str, host: str, label: str = "tryak") -> str:
@@ -896,7 +891,6 @@ async def lifespan(app: FastAPI):
     scheduler_task   = asyncio.create_task(scheduler_loop())
     traffic_task     = asyncio.create_task(traffic_loop())
 
-    logger.info(f"🚀 tryak-Xray Gateway started on port {CONFIG['port']}")
     yield
 
     for t in [keepalive_task, scheduler_task, traffic_task, _xray_stdout_task]:
