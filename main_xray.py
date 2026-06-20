@@ -1197,8 +1197,12 @@ async def subscription_raw(uid: str):
     return Response(content=encoded, media_type="text/plain; charset=utf-8")
 
 
-@app.get("/sub/{uid}", response_class=HTMLResponse)
-async def subscription_page(uid: str, request: Request):
+@app.get("/sub/{uid}")
+async def subscription_page(uid: str):
+    return RedirectResponse(url=f"/sub/{uid}/raw", status_code=302)
+
+@app.get("/sub/{uid}/page", response_class=HTMLResponse)
+async def subscription_page_html(uid: str, request: Request):
     async with LINKS_LOCK:
         link = LINKS.get(uid)
     if not link:
@@ -1417,15 +1421,6 @@ body{{font-family:'Vazirmatn',sans-serif;background:radial-gradient(circle at 20
       <div class="info-row">
         <span class="info-key"><i class="ti ti-shield-lock"></i> پروتکل</span>
         <span class="info-val" style="font-size:11px;text-align:left">{proto_badge}</span>
-      </div>
-    </div>
-
-    <!-- ── Sub Link ── -->
-    <div class="sub-section">
-      <div class="conn-label"><i class="ti ti-rss"></i> لینک سابسکریپشن (Import خودکار)</div>
-      <div class="conn-text" id="sub-link">https://{host}/sub/{uid}/raw</div>
-      <div class="btn-row">
-        <button class="btn btn-primary" onclick="copySubLink()"><i class="ti ti-copy"></i> کپی لینک ساب</button>
       </div>
     </div>
 
