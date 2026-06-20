@@ -5,6 +5,7 @@ import hashlib
 import secrets
 import time
 import signal
+import base64
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -775,12 +776,12 @@ async def scheduler_loop():
                 SESSIONS.pop(tok, None)
 
 async def traffic_loop():
-    """مصرف واقعی هر لینک رو هر ۲ دقیقه از Xray می‌خونه. برای جلوگیری از نوشتن زیاد
-    روی دیسک (و کرش سرور به‌خاطر I/O زیاد)، فقط هر ۱۰ دور یا وقتی سهمیه‌ای تموم بشه ذخیره می‌کنه.
-    همچنین دلتای مصرف (نسبت به پول قبلی) رو به‌عنوان ترافیک ساعت جاری در hourly_traffic
-    و مجموع کل در stats['total_bytes'] جمع می‌زنه — این داده برای نمودار «ترافیک امروز» استفاده می‌شه."""
+    """مصرف واقعی هر لینک رو هر ۳۰ ثانیه از Xray می‌خونه تا نمودار «ترافیک امروز» سریع آپدیت بشه.
+    خود فراخوانی Xray API سبکه (یه pipe محلی)، پس این فاصله مشکلی برای CPU ایجاد نمی‌کنه؛
+    اما برای جلوگیری از I/O زیاد دیسک، ذخیره‌سازی همچنان فقط هر ~۵ دقیقه (هر ۱۰ دور) یا
+    وقتی سهمیه‌ای تموم بشه انجام می‌شه."""
     global _last_usage_snapshot
-    await asyncio.sleep(90)
+    await asyncio.sleep(20)
     poll_count = 0
     while True:
         try:
@@ -822,7 +823,7 @@ async def traffic_loop():
                         logger.info(f"📊 سهمیه لینک '{label}' تمام شد و غیرفعال شد.")
         except Exception as e:
             logger.warning(f"⚠️ traffic loop error: {e}")
-        await asyncio.sleep(120)
+        await asyncio.sleep(30)
 
 # ───────── Link generation helpers ─────────
 def generate_vless_link(uid: str, host: str, label: str = "tryak") -> str:
@@ -1231,7 +1232,28 @@ async def unblock_ip(ip: str, _=Depends(require_auth)):
     return {"ok": True}
 
 # ───────── Subscription Page ─────────
-@app.get("/sub/{uid}", response_class=HTMLResponse)
+@app.get("/sub/{uid}/raw", response_class=Response)
+async def subscription_raw(uid: str):
+    """لینک سابسکریپشن استاندارد (Base64) برای وارد کردن مستقیم در کلاینت‌هایی مثل
+    v2rayNG / v2rayN / NekoBox / Streisand و غیره. خروجی متن ساده‌ست: هر خط یک
+    لینک (vless:// trojan:// ss://...)، که کل متن با Base64 استاندارد انکود شده.
+    HTTP Proxy در این لیست نمیاد چون فرمت قابل‌import در کلاینت‌های VPN نیست."""
+    async with LINKS_LOCK:
+        link = LINKS.get(uid)
+    if not link:
+        raise HTTPException(404, "لینک یافت نشد")
+
+    host     = _detect_host()
+    ss_idx   = sum(1 for u, l in LINKS.items() if "shadowsocks" in link_protocols(l) and u < uid)
+    http_idx = sum(1 for u, l in LINKS.items() if "http" in link_protocols(l) and u < uid)
+    conns    = get_link_connections(uid, link, host, ss_idx, http_idx)
+
+    importable = [c["link"] for c in conns if c.get("link", "").startswith(("vless://", "trojan://", "ss://"))]
+    raw_text = "\n".join(importable)
+    encoded = base64.b64encode(raw_text.encode()).decode()
+    return Response(content=encoded, media_type="text/plain; charset=utf-8")
+
+
 async def subscription_page(uid: str, request: Request):
     async with LINKS_LOCK:
         link = LINKS.get(uid)
@@ -1279,6 +1301,8 @@ async def subscription_page(uid: str, request: Request):
         {f'<button class="btn btn-outline" onclick="showQR({i})"><i class="ti ti-qrcode"></i> QR</button>' if show_qr else ''}
       </div>
     </div>"""
+
+    conn_links_js = ",".join(json.dumps(c.get("link", "")) for c in conns)
 
 
     html = f"""<!DOCTYPE html>
@@ -1383,11 +1407,22 @@ body{{font-family:'Vazirmatn',sans-serif;background:radial-gradient(circle at 20
       <div class="info-row"><span class="info-key"><i class="ti ti-server"></i> سرور</span><span class="info-val">{host}</span></div>
       <div class="info-row"><span class="info-key"><i class="ti ti-shield-lock"></i> پروتکل</span><span class="info-val" style="text-align:left">{proto_badge}</span></div>
     </div>
+    <div class="conn-section" style="margin-bottom:12px">
+      <div class="conn-label"><i class="ti ti-rss"></i> لینک سابسکریپشن (Import خودکار)</div>
+      <div class="conn-text" id="sub-link">https://{host}/sub/{uid}/raw</div>
+      <div class="btn-row">
+        <button class="btn btn-primary" onclick="copySubLink()"><i class="ti ti-copy"></i> کپی لینک ساب</button>
+      </div>
+    </div>
+    <div class="btn-row" style="margin-bottom:12px">
+      <button class="btn btn-outline" onclick="copyAllConfigs()" style="width:100%"><i class="ti ti-copy"></i> کپی تمام کانفیگ‌ها</button>
+    </div>
     {conn_sections_html}
     <div class="footer">tryak · Xray Gateway</div>
   </div>
 </div>
 <script>
+const ALL_LINKS=[{conn_links_js}];
 function copyLink(i){{
   const t=document.getElementById('conn-link-'+(i||0)).textContent.trim();
   navigator.clipboard.writeText(t).then(()=>{{
@@ -1399,6 +1434,22 @@ function copyLink(i){{
 function showQR(i){{
   const t=document.getElementById('conn-link-'+(i||0)).textContent.trim();
   window.open('https://api.qrserver.com/v1/create-qr-code/?size=300x300&data='+encodeURIComponent(t),'_blank');
+}}
+function copySubLink(){{
+  const t=document.getElementById('sub-link').textContent.trim();
+  navigator.clipboard.writeText(t).then(()=>{{
+    const b=event.currentTarget;const o=b.innerHTML;
+    b.innerHTML='<i class="ti ti-check"></i> کپی شد!';
+    setTimeout(()=>b.innerHTML=o,2000);
+  }});
+}}
+function copyAllConfigs(){{
+  const t=ALL_LINKS.filter(Boolean).join('\n');
+  navigator.clipboard.writeText(t).then(()=>{{
+    const b=event.currentTarget;const o=b.innerHTML;
+    b.innerHTML='<i class="ti ti-check"></i> همه کپی شد!';
+    setTimeout(()=>b.innerHTML=o,2000);
+  }});
 }}
 </script>
 </body>
@@ -2118,35 +2169,16 @@ function showDetail(l){
       </div>`:''}
     </div>`;
   });
-  html+=`<div style="margin-top:6px">
+  html+=`<div style="margin-top:6px;display:flex;flex-direction:column;gap:8px">
     <a href="/sub/${l.uuid}" target="_blank" class="btn btn-outline btn-sm" style="text-decoration:none;width:100%;justify-content:center"><i class="ti ti-external-link"></i>صفحه اشتراک (همه‌ی پروتکل‌ها)</a>
-  </div>`;
-  html+=`<div style="margin-top:18px;padding-top:14px;border-top:1px solid var(--border)">
-    <div class="form-label" style="margin-bottom:8px"><i class="ti ti-world"></i> IPهای متصل</div>
-    <div id="modal-clients-list" style="font-size:12px;color:var(--text-2)">در حال بارگذاری...</div>
+    <button class="btn btn-outline btn-sm" onclick="copySubscriptionLink('${l.uuid}')" style="width:100%;justify-content:center"><i class="ti ti-rss"></i>کپی لینک ساب (Import خودکار)</button>
   </div>`;
   document.getElementById('detail-content').innerHTML=html;
   document.getElementById('detail-modal').classList.add('show');
-  loadLinkClients(l.uuid);
 }
-async function loadLinkClients(uid){
-  const box=document.getElementById('modal-clients-list');
-  try{
-    const r=await fetch(`/api/links/${uid}/clients`);
-    if(!r.ok) throw new Error();
-    const d=await r.json();
-    if(!d.clients.length){ box.innerHTML='هنوز هیچ کلاینتی به این لینک وصل نشده.'; return; }
-    box.innerHTML=`<table style="width:100%;border-collapse:collapse">
-      <thead><tr style="text-align:right;color:var(--text-3);font-size:10.5px">
-        <th style="padding:4px 0">IP</th><th>کشور</th><th>آخرین اتصال</th><th>تعداد</th>
-      </tr></thead>
-      <tbody>${d.clients.map(c=>`<tr style="border-top:1px solid var(--border)">
-        <td style="padding:5px 0;direction:ltr;text-align:right;font-family:ui-monospace,monospace">${c.ip}</td>
-        <td>${c.flag} ${c.country}</td>
-        <td style="color:var(--text-3)">${c.last_seen?new Date(c.last_seen).toLocaleString('fa-IR'):'-'}</td>
-        <td>${c.hits}</td>
-      </tr>`).join('')}</tbody></table>`;
-  }catch(e){ box.innerHTML='خطا در دریافت لیست IPها.'; }
+function copySubscriptionLink(uid){
+  const t=window.location.origin+'/sub/'+uid+'/raw';
+  navigator.clipboard.writeText(t).then(()=>toast('لینک ساب کپی شد ✅'));
 }
 function hideDetailModal(){document.getElementById('detail-modal').classList.remove('show')}
 function copyModalLink(i){
