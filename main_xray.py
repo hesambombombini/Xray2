@@ -23,18 +23,15 @@ import logging
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("tryak-Xray")
 
-# ───── CPU usage بر اساس cgroup خودِ کانتینر (بدون psutil) ─────
-# Railway کانتینر رو با محدودیت cgroup اجرا می‌کنه؛ مصرف CPU رو مستقیم از همون
-# cgroup می‌خونیم و دلتا می‌گیریم — سبک، بدون وابستگی باینری، بدون بلاک کردن event loop.
 _cpu_last = {"t": None, "usage": None}
 
 def _read_cgroup_cpu_usage_usec():
-    p = Path("/sys/fs/cgroup/cpu.stat")          # cgroup v2
+    p = Path("/sys/fs/cgroup/cpu.stat")
     if p.exists():
         for line in p.read_text().splitlines():
             if line.startswith("usage_usec"):
                 return int(line.split()[1])
-    for c in ("/sys/fs/cgroup/cpu/cpuacct.usage",  # cgroup v1 (ns → usec)
+    for c in ("/sys/fs/cgroup/cpu/cpuacct.usage",
               "/sys/fs/cgroup/cpuacct/cpuacct.usage"):
         cp = Path(c)
         if cp.exists():
@@ -42,14 +39,14 @@ def _read_cgroup_cpu_usage_usec():
     return None
 
 def _cgroup_ncpu():
-    p = Path("/sys/fs/cgroup/cpu.max")            # cgroup v2 quota
+    p = Path("/sys/fs/cgroup/cpu.max")
     if p.exists():
         parts = p.read_text().split()
         if parts and parts[0] != "max":
             quota, period = int(parts[0]), int(parts[1])
             if quota > 0 and period > 0:
                 return max(quota / period, 0.01)
-    q  = Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")   # cgroup v1 quota
+    q  = Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
     pe = Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
     if q.exists() and pe.exists():
         quota = int(q.read_text().strip()); period = int(pe.read_text().strip())
@@ -58,7 +55,6 @@ def _cgroup_ncpu():
     return os.cpu_count() or 1
 
 def get_cpu_percent() -> float:
-    """درصد مصرف CPU کانتینر (غیربلاک‌کننده). فراخوانی اول 0.0 برمی‌گردونه."""
     usage = _read_cgroup_cpu_usage_usec()
     now = time.monotonic()
     if usage is None:
@@ -74,16 +70,13 @@ def get_cpu_percent() -> float:
     pct = busy / (dt * _cgroup_ncpu()) * 100
     return round(max(0.0, min(pct, 100.0)), 1)
 
-# prime اولیه تا اولین /stats مقدار معنادار بده
 get_cpu_percent()
 
-# ───────── Platform Detection ─────────
 _HOST_CACHE: str | None = None
 _PLATFORM_CACHE: str | None = None
 
 def _detect_host() -> str:
-    # دامنه‌ی عمومی در زمان اجرا تغییر نمی‌کنه؛ یک‌بار محاسبه و کش می‌شه
-    # تا هر درخواست/دور حلقه env lookup تکراری انجام نشه.
+
     global _HOST_CACHE
     if _HOST_CACHE is not None:
         return _HOST_CACHE
@@ -91,28 +84,22 @@ def _detect_host() -> str:
     return _HOST_CACHE
 
 def __detect_host_uncached() -> str:
-    # فقط Railway — دامنه‌ی عمومی سرویس
+
     h = os.environ.get("RAILWAY_PUBLIC_DOMAIN")
     if h: return h
-    h = os.environ.get("PUBLIC_DOMAIN")  # override دستی در صورت نیاز
+    h = os.environ.get("PUBLIC_DOMAIN")
     if h: return h
     return "localhost"
 
 def _detect_reality_public_port() -> int:
-    """پورت خارجی TCP Proxy که کلاینت باید بهش وصل بشه.
-    در Railway با TCP Proxy یه پورت رندوم میده — اون رو توی REALITY_PUBLIC_PORT بذار.
-    اگه ست نشده، از همون پورت داخلی استفاده میکنه."""
     p = os.environ.get("REALITY_PUBLIC_PORT")
     if p: return int(p)
     return CONFIG["xray_reality_port"]
 
 def _detect_reality_host() -> str:
-    """دامنه TCP Proxy مخصوص Reality را برمی‌گرداند.
-    در Railway باید REALITY_TCP_DOMAIN را دستی ست کنی (مثلاً xyz.railway.app:8443 بدون پورت).
-    اگه ست نشده باشه، از همون دامنه عمومی استفاده می‌کنه."""
     h = os.environ.get("REALITY_TCP_DOMAIN")
-    if h: return h.split(":")[0]  # فقط هاست، بدون پورت
-    # fallback به دامنه عمومی
+    if h: return h.split(":")[0]
+
     return _detect_host()
 
 def _detect_platform() -> str:
@@ -123,7 +110,7 @@ def _detect_platform() -> str:
     return _PLATFORM_CACHE
 
 def __detect_platform_uncached() -> str:
-    # این پروژه فقط برای Railway ساخته شده
+
     if os.environ.get("RAILWAY_PUBLIC_DOMAIN") or os.environ.get("RAILWAY_ENVIRONMENT"):
         return "Railway"
     return "Local"
@@ -133,32 +120,26 @@ if not _secret_env:
     logger.warning("⚠️ SECRET_KEY تنظیم نشده! یک مقدار رندوم موقت استفاده می‌شود.")
 
 CONFIG = {
-    # FastAPI همیشه روی 8000 داخلی listen می‌کنه — Nginx روی $PORT گوش می‌ده
+
     "port":   8000,
     "secret": _secret_env or secrets.token_urlsafe(32),
     "host":   _detect_host(),
-    # پورت‌های داخلی Xray (روی localhost) — پشت Nginx
+
     "xray_vless_port":    10000,
     "xray_trojan_port":   10001,
     "xray_xhttp_port":    10004,
     "xray_api_port":      10085,
-    # پورت Reality — این یکی باید مستقیم (نه پشت Nginx) به بیرون اکسپوز بشه
-    # چون Reality خودش handshake واقعی TLS رو هندل می‌کنه. در Railway باید
-    # یه TCP Proxy جدا روی همین پورت بسازی (Settings → Networking → TCP Proxy).
+
     "xray_reality_port":  int(os.environ.get("REALITY_PORT", "8443")),
 }
 
-# دامنه‌ای که Reality وانمود می‌کنه بهش وصل شده (camouflage) — باید یه سایت واقعی
-# با TLS1.3 و HTTP/2 باشه. قابل تنظیم با env REALITY_DEST / REALITY_SNI.
 REALITY_DEST = os.environ.get("REALITY_DEST", "www.microsoft.com:443")
 REALITY_SNI  = os.environ.get("REALITY_SNI", REALITY_DEST.split(":")[0])
 
-# ───────── Persistence ─────────
 _DATA_DIR = Path("/data") if Path("/data").exists() else Path("/tmp")
 DATA_FILE  = _DATA_DIR / "xray_gateway_data.json"
 XRAY_BIN   = Path(os.environ.get("XRAY_BIN", "/usr/local/bin/xray"))
 
-# ───────── State ─────────
 http_client: httpx.AsyncClient | None = None
 xray_process: "asyncio.subprocess.Process | None" = None
 keepalive_task: asyncio.Task | None  = None
@@ -173,28 +154,21 @@ stats = {
 }
 error_logs: deque = deque(maxlen=50)
 hourly_traffic: dict = defaultdict(int)
-# مجموع ترافیک هر روز (YYYY-MM-DD -> bytes) برای نمودار ۷ روزه؛ فقط چند روز اخیر نگه داشته می‌شه
+
 daily_traffic: dict = defaultdict(int)
-# آخرین مقدار تجمعی هر کاربر که از Xray API خونده شده — برای محاسبه‌ی دلتا
-# (مصرف جدید بین این پول و پول قبلی) که به hourly_traffic اضافه می‌شه.
+
 _last_usage_snapshot: dict = {}
 
-# لینک‌ها  uid -> {label, protocol, limit_bytes, used_bytes, created_at, expires_at, active, password(trojan)}
 LINKS: dict = {}
 LINKS_LOCK = asyncio.Lock()
 RELOAD_LOCK = asyncio.Lock()
 
-# کلیدهای Reality (یک‌بار ساخته و persist می‌شن تا با ری‌استارت لینک‌های قبلی خراب نشن)
-# dest/sni هم اینجا persist می‌شن تا از خود پنل قابل تنظیم باشن (نه فقط از env).
 REALITY: dict = {"private_key": "", "public_key": "", "short_id": "", "dest": "", "sni": ""}
 
 def reality_dest() -> str:
-    """مقصد camouflage برای Reality (host:port). اولویت: مقدار ست‌شده در پنل ← env REALITY_DEST."""
     return (REALITY.get("dest") or "").strip() or REALITY_DEST
 
 def reality_sni() -> str:
-    """SNI که کلاینت Reality وانمود می‌کند به آن وصل شده.
-    اولویت: مقدار ست‌شده در پنل ← env REALITY_SNI ← هاستِ dest."""
     s = (REALITY.get("sni") or "").strip()
     if s:
         return s
@@ -204,25 +178,19 @@ def reality_sni() -> str:
 
 BLOCKED_IPS: set = set()
 
-# ───────── Client IP Tracking (از روی accessLog خود Xray) ─────────
-# uid -> { ip: {"country","country_code","city","first_seen","last_seen","hits"} }
 link_clients: dict = defaultdict(dict)
 LINK_CLIENTS_LOCK = asyncio.Lock()
 
-_ip_geo_cache: dict = {}          # ip -> {"country","country_code","city"}
+_ip_geo_cache: dict = {}
 _IP_GEO_CACHE_MAX = 10000
-# دیگه از فایل روی دیسک استفاده نمی‌کنیم؛ خروجی Xray مستقیم از stdout پروسه،
-# به‌صورت stream و event-driven خونده می‌شه (نه polling روی فایل) — هم دیسک
-# درگیر نمی‌شه، هم CPU کمتر مصرف می‌شه چون دیگه هر ۲ ثانیه open/seek نداریم.
+
 _xray_stdout_task: "asyncio.Task | None" = None
 
-# session
 SESSION_COOKIE = "tryak_xray_session"
 SESSION_TTL    = 60 * 60 * 24 * 7
 SESSIONS: dict = {}
 SESSIONS_LOCK  = asyncio.Lock()
 
-# ───────── Auth helpers ─────────
 def hash_password(pw: str) -> str:
     return hashlib.sha256(f"{pw}{CONFIG['secret']}".encode()).hexdigest()
 
@@ -260,7 +228,6 @@ async def require_auth(request: Request):
         raise HTTPException(status_code=401, detail="unauthorized")
     return token
 
-# ───────── UUID / helpers ─────────
 def generate_uuid(seed: str | None = None) -> str:
     if seed is None:
         return str(_uuid_mod.uuid4())
@@ -273,14 +240,12 @@ def uptime() -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 def fmt_bytes(b: int) -> str:
-    """برای نمایش limit — صفر یعنی نامحدود"""
     if not b: return "نامحدود ♾️"
     if b >= 1024**3: return f"{b/1024**3:.1f} GB"
     if b >= 1024**2: return f"{b/1024**2:.1f} MB"
     return f"{b/1024:.1f} KB"
 
 def fmt_usage(b: int) -> str:
-    """برای نمایش مصرف واقعی — صفر یعنی 0 نه نامحدود"""
     if b >= 1024**3: return f"{b/1024**3:.1f} GB"
     if b >= 1024**2: return f"{b/1024**2:.1f} MB"
     if b >= 1024: return f"{b/1024:.1f} KB"
@@ -305,7 +270,6 @@ def is_link_expired(link: dict) -> bool:
     return datetime.fromisoformat(exp) <= datetime.now()
 
 def _normalize_tags(raw) -> list:
-    """برچسب‌ها رو به لیست تمیز و یکتا تبدیل می‌کنه (از رشته‌ی کاما-جدا یا لیست)."""
     if raw is None:
         return []
     if isinstance(raw, str):
@@ -326,8 +290,7 @@ def _normalize_tags(raw) -> list:
     return out
 
 def get_container_memory_percent() -> float:
-    """درصد واقعی مصرف RAM کانتینر را برمی‌گرداند (بر اساس محدودیت cgroup، نه کل سرور میزبان)."""
-    # cgroup v2
+
     try:
         cur = Path("/sys/fs/cgroup/memory.current")
         lim = Path("/sys/fs/cgroup/memory.max")
@@ -340,24 +303,24 @@ def get_container_memory_percent() -> float:
                     return round(used / limit * 100, 1)
     except Exception:
         pass
-    # cgroup v1
+
     try:
         cur = Path("/sys/fs/cgroup/memory/memory.usage_in_bytes")
         lim = Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")
         if cur.exists() and lim.exists():
             used = int(cur.read_text().strip())
             limit = int(lim.read_text().strip())
-            # یه محدودیت غیرفعال (خیلی بزرگ) معمولاً یعنی هیچ limit‌ای ست نشده
+
             if 0 < limit < (1 << 62):
                 return round(used / limit * 100, 1)
     except Exception:
         pass
-    # fallback: مصرف از /proc/meminfo (بدون psutil)
+
     try:
         info = {}
         for line in Path("/proc/meminfo").read_text().splitlines():
             k, _, v = line.partition(":")
-            info[k.strip()] = int(v.strip().split()[0])  # kB
+            info[k.strip()] = int(v.strip().split()[0])
         total = info.get("MemTotal", 0)
         avail = info.get("MemAvailable", info.get("MemFree", 0))
         if total > 0:
@@ -382,13 +345,11 @@ def _is_private_ip(ip: str) -> bool:
     return ip.startswith(_PRIVATE_IP_PREFIXES)
 
 async def get_ip_geo(ip: str) -> dict:
-    """geo کش‌شده برای یک IP. روی fail یه dict خالی برمی‌گردونه."""
     if ip in _ip_geo_cache:
         return _ip_geo_cache[ip]
     if _is_private_ip(ip):
         return {}
-    # http_client در lifespan ساخته می‌شه؛ اگه هنوز آماده نیست، geo رو رد می‌کنیم
-    # تا از ساخت کلاینت بدون بسته‌شدن (نشتی منابع) جلوگیری بشه.
+
     if http_client is None:
         return {}
     try:
@@ -412,11 +373,6 @@ async def get_ip_geo(ip: str) -> dict:
         pass
     return {}
 
-# Xray با email روی هر کلاینت، در accessLog خطی شبیه این می‌نویسه (نسخه‌های جدید Xray-core
-# پیشوند "tcp:" / "udp:" رو هم قبل از IP اضافه می‌کنن و گاهی email با کاما/کاراکترهای دیگه
-# ادامه پیدا می‌کنه، مثلاً "email: , Domain: ..."):
-# 2025/05/03 10:31:52.270544 from tcp:1.2.3.4:51514 accepted tcp:example.com:443 [vless-in >> direct] email: <uid>
-# 2025/05/03 10:31:52.270544 from tcp::51514 accepted tcp:example.com:443 [vless-in >> direct] email: <uid>
 _ACCESS_LOG_RE = re.compile(
     r"from\s+(?:tcp|udp):?(?:\[(?P<ip6>[0-9a-fA-F:]+)\]|(?P<ip4>\d{1,3}(?:\.\d{1,3}){3}))?:\d*\s+accepted.*?email:\s*(?P<email>[\w-]+)"
 )
@@ -446,10 +402,6 @@ async def _record_client_ip(uid: str, ip: str):
                     entry["city"] = info.get("city", "")
 
 async def xray_stdout_reader(proc: "asyncio.subprocess.Process"):
-    """خط‌های stdout پروسه‌ی Xray رو همون لحظه که می‌رسن می‌خونه (event-driven، نه polling).
-    دیگه هیچ فایلی روی دیسک نوشته/خونده نمی‌شه؛ هم سبک‌تره هم بدون تاخیر ۲ ثانیه‌ای.
-    خط‌های غیر access (مثل خطاها/هشدارهای خود Xray) رو از طریق logger خودمون پاس می‌ده تا
-    توی لاگ‌های Railway/Docker هم دیده بشن (چون دیگه stdout مستقیم به کانتینر وصل نیست)."""
     if not proc.stdout:
         return
     try:
@@ -464,14 +416,11 @@ async def xray_stdout_reader(proc: "asyncio.subprocess.Process"):
             if m:
                 ip = m.group("ip4") or m.group("ip6")
                 uid = m.group("email")
-                # برخی خط‌ها (مثل اتصال داخلی به api-in یا UDP بدون IP مشخص، یعنی "tcp::port")
-                # IP خالی دارن — این‌ها رو نادیده می‌گیریم، فقط IP واقعی ثبت می‌شه.
+
                 if ip and uid and uid in LINKS:
                     asyncio.create_task(_record_client_ip(uid, ip))
             elif text.startswith("[Error]") or "panic" in text.lower():
-                # فقط خطاها/هشدارهای واقعی Xray رو به لاگ برنامه پاس می‌دیم؛ خط‌های Info
-                # (که با loglevel=info بسیار پرحجم‌اند، مخصوصاً برای UDP) رو دیگه دوباره
-                # از طریق logger پایتون چاپ نمی‌کنیم تا CPU/IO اضافه مصرف نشه.
+
                 logger.warning(f"[xray] {text}")
     except asyncio.CancelledError:
         raise
@@ -479,22 +428,17 @@ async def xray_stdout_reader(proc: "asyncio.subprocess.Process"):
         logger.warning(f"⚠️ xray stdout reader error: {e}")
 
 def link_protocols(link: dict) -> list:
-    """لیست پروتکل‌های فعال یک لینک. از فیلد جدید protocols (چندتایی) پشتیبانی می‌کند
-    و در صورت نبودش، به فیلد قدیمی protocol (تکی) fallback می‌کند تا داده‌های قبلی خراب نشن."""
     protos = link.get("protocols")
     if isinstance(protos, list) and protos:
         return protos
     single = link.get("protocol")
     return [single] if single else ["vless"]
 
-# ───────── Xray Config Generator ─────────
 SUPPORTED_PROTOCOLS = ["vless", "trojan", "vless-xhttp", "vless-reality"]
 
 def build_xray_config() -> dict:
-    """کانفیگ کامل Xray را بر اساس LINKS فعلی می‌سازد."""
     inbounds = []
 
-    # ── VLESS + WebSocket (پورت داخلی) ──
     vless_clients = []
     for uid, link in LINKS.items():
         if "vless" in link_protocols(link) and link.get("active"):
@@ -517,7 +461,6 @@ def build_xray_config() -> dict:
             "sniffing": {"enabled": True, "destOverride": ["http", "tls"]}
         })
 
-    # ── Trojan + WebSocket ──
     trojan_clients = []
     for uid, link in LINKS.items():
         if "trojan" in link_protocols(link) and link.get("active"):
@@ -540,7 +483,6 @@ def build_xray_config() -> dict:
             "sniffing": {"enabled": True, "destOverride": ["http", "tls"]}
         })
 
-    # ── VLESS + XHTTP (پشت Nginx، مسیر /xray-xhttp) ──
     xhttp_clients = []
     for uid, link in LINKS.items():
         if "vless-xhttp" in link_protocols(link) and link.get("active"):
@@ -563,7 +505,6 @@ def build_xray_config() -> dict:
             "sniffing": {"enabled": True, "destOverride": ["http", "tls"]}
         })
 
-    # ── VLESS + Reality (مستقیم، بدون Nginx — به یه TCP Proxy جدا روی Railway نیاز داره) ──
     reality_clients = []
     for uid, link in LINKS.items():
         if "vless-reality" in link_protocols(link) and link.get("active"):
@@ -596,23 +537,13 @@ def build_xray_config() -> dict:
     elif reality_clients:
         logger.warning("⚠️ کلاینت Reality وجود دارد ولی کلید Reality ساخته نشده؛ این inbound نادیده گرفته شد.")
 
-
-
-
-    # ── Outbound ──
     outbounds = [
         {"tag": "direct",  "protocol": "freedom",  "settings": {}},
         {"tag": "blocked", "protocol": "blackhole", "settings": {}},
     ]
 
-    # ── Routing ──
-    # geoip/geosite کاملاً حذف شدن؛ Xray دیگه هیچ فایل دیتای geo در حافظه لود نمی‌کنه (کاهش مصرف رم).
     routing_rules = []
 
-    # ── بلاک سایت‌های +۱۸ / دسته‌های geosite حذف شد (برای کاهش مصرف رم؛ Xray دیگر geosite.dat را در حافظه لود نمی‌کند) ──
-
-    # ── دامنه‌های سفارشی برای بلاک (env BLOCKED_DOMAINS، با کاما جدا شده) ──
-    # نمونه: BLOCKED_DOMAINS="example.com,ads.test.com,keyword:tracker"
     custom_domains = [d.strip() for d in os.environ.get("BLOCKED_DOMAINS", "").split(",") if d.strip()]
     if custom_domains:
         routing_rules.append({
@@ -622,9 +553,6 @@ def build_xray_config() -> dict:
         })
         logger.warning(f"🚫 بلاک دامنه‌های سفارشی: {custom_domains}")
 
-    # ── بلاک‌کردن IP کلاینت‌ها (source-based) ──
-    # این قانون باعث می‌شه IPهای داخل BLOCKED_IPS واقعاً توی خود Xray به blackhole برن،
-    # نه اینکه فقط توی دیتابیس ذخیره/نمایش داده بشن. قبل از بقیه‌ی قوانین قرار می‌گیره.
     if BLOCKED_IPS:
         routing_rules.insert(0, {
             "type": "field",
@@ -634,10 +562,7 @@ def build_xray_config() -> dict:
 
     return {
         "log": {
-            # لاگ کامل خاموش است (نیازی به لاگ نداریم). دیگه stdout هم خونده نمی‌شه،
-            # پس نه I/O دیسک داریم، نه پردازش regex per-connection، نه task اضافه.
-            # ⚠️ با loglevel=none ردیابی خودکار IP/کشورِ کلاینت‌ها غیرفعال می‌شه؛
-            #    اگه روزی اون فیچر رو خواستی، این رو "info" کن و stdout reader رو برگردون.
+
             "loglevel": "none",
             "access": "",
         },
@@ -678,7 +603,6 @@ def build_xray_config() -> dict:
         }
     }
 
-# ───────── Xray Process Management ─────────
 _XRAY_CONFIG_PATH = _DATA_DIR / "xray_config.json"
 
 async def write_xray_config():
@@ -696,7 +620,6 @@ async def start_xray():
 
     global _xray_stdout_task
 
-    # اول پروسه قبلی رو می‌بندیم
     if xray_process and xray_process.returncode is None:
         xray_process.terminate()
         try:
@@ -707,8 +630,6 @@ async def start_xray():
         _xray_stdout_task.cancel()
         _xray_stdout_task = None
 
-    # لاگ Xray کاملاً خاموشه (loglevel=none)، پس stdout/stderr رو مستقیم دور می‌ریزیم
-    # و دیگه task خواننده‌ی stdout نمی‌سازیم — صرفه‌جویی در RAM/CPU.
     xray_process = await asyncio.create_subprocess_exec(
         str(XRAY_BIN), "run", "-c", str(_XRAY_CONFIG_PATH),
         stdout=asyncio.subprocess.DEVNULL,
@@ -716,7 +637,6 @@ async def start_xray():
     )
 
 async def query_xray_stats() -> dict:
-    """مصرف هر کاربر را از Xray API می‌خونه (بدون نیاز به وابستگی جدید، با باینری خود xray)."""
     if not (xray_process and xray_process.returncode is None):
         return {}
     try:
@@ -739,7 +659,6 @@ async def query_xray_stats() -> dict:
     return usage
 
 async def capture_traffic_baseline():
-    """قبل از ری‌استارت Xray، مصرف فعلی رو به‌عنوان baseline ذخیره می‌کنه تا با ری‌استارت صفر نشه."""
     global _last_usage_snapshot
     usage = await query_xray_stats()
     if not usage:
@@ -750,15 +669,10 @@ async def capture_traffic_baseline():
             if uid in usage:
                 link["baseline_bytes"] = link.get("baseline_bytes", 0) + usage[uid]
                 link["used_bytes"] = link["baseline_bytes"]
-    # بعد از ری‌استارت Xray شمارنده‌های API از صفر شروع می‌شن؛ snapshot رو پاک می‌کنیم
-    # تا دور بعدی traffic_loop به‌جای محاسبه‌ی دلتای منفی، از صفر دلتا بگیره.
+
     _last_usage_snapshot = {}
 
 async def reload_xray():
-    """کانفیگ را دوباره می‌نویسد و Xray را restart می‌کند.
-    توجه: Xray-core از SIGHUP پشتیبانی نمی‌کنه؛ باید کامل restart بشه.
-    این تابع ممکنه از background task (بدون await در مسیر اصلی درخواست) صدا زده شه؛
-    برای جلوگیری از race بین چند ری‌استارت هم‌زمان، با یک لاک serialize می‌شه."""
     async with RELOAD_LOCK:
         await capture_traffic_baseline()
         await start_xray()
@@ -770,22 +684,15 @@ def xray_status() -> dict:
         return {"running": False, "pid": xray_process.pid, "uptime": None}
     return {"running": True, "pid": xray_process.pid}
 
-# ───────── Xray User API (افزودن/حذف کاربر بدون ری‌استارت) ─────────
-# نسخه‌های Xray-core از ~v25.8 به بعد دو دستور api adu (AddInboundUser) و
-# api rmu (RemoveInboundUser) دارن که اجازه می‌دن کاربر رو روی یک inbound در
-# حالِ اجرا اضافه/حذف کنیم — بدون restart کامل که همه‌ی اتصال‌های فعال رو قطع می‌کنه.
-# اگه باینری این دستورها رو پشتیبانی نکنه، خودکار به reload کامل fallback می‌کنیم،
-# پس رفتار بدترین‌حالت دقیقاً مثل قبل (reload) می‌مونه و هیچ‌چیز خراب نمی‌شه.
 INBOUND_TAGS = {
     "vless":         "vless-in",
     "trojan":        "trojan-in",
     "vless-xhttp":   "vless-xhttp-in",
     "vless-reality": "vless-reality-in",
 }
-_userapi_supported: bool | None = None   # None = هنوز تشخیص داده نشده
+_userapi_supported: bool | None = None
 
 async def _run_xray_api(*args: str, timeout: float = 8.0) -> tuple[int, str]:
-    """یک دستور `xray api ...` اجرا می‌کنه و (returncode, خروجی متنی) برمی‌گردونه."""
     proc = await asyncio.create_subprocess_exec(
         str(XRAY_BIN), "api", *args,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
@@ -794,12 +701,11 @@ async def _run_xray_api(*args: str, timeout: float = 8.0) -> tuple[int, str]:
     return (proc.returncode if proc.returncode is not None else -1), out.decode(errors="ignore")
 
 async def detect_userapi_support() -> bool:
-    """یک‌بار تشخیص می‌ده که باینری Xray دستورهای adu/rmu رو داره یا نه."""
     global _userapi_supported
     if _userapi_supported is not None:
         return _userapi_supported
     try:
-        # بدون آرگومان صدا می‌زنیم؛ اگه دستور ناشناخته باشه Xray صراحتاً می‌گه.
+
         _, out = await _run_xray_api("adu", timeout=8.0)
         low = out.lower()
         _userapi_supported = ("unknown command" not in low
@@ -815,18 +721,14 @@ async def detect_userapi_support() -> bool:
     return _userapi_supported
 
 def _api_client_for(uid: str, link: dict, proto: str) -> dict:
-    """آبجکت کاربر برای یک پروتکل، مطابق همون چیزی که build_xray_config می‌سازه."""
     if proto == "trojan":
         return {"password": link.get("password", uid), "email": uid}
     if proto == "vless-reality":
         return {"id": uid, "email": uid, "flow": "xtls-rprx-vision"}
-    # vless, vless-xhttp
+
     return {"id": uid, "email": uid}
 
 def _api_inbound_for(proto: str, clients: list) -> dict | None:
-    """یک inbound معتبر (InboundDetourConfig) با tag درست برای استفاده در `xray api adu`.
-    فقط tag + protocol + settings.clients واقعاً توسط adu استفاده می‌شن، بقیه فقط برای
-    معتبر بودن ساختار JSON هستن."""
     tag = INBOUND_TAGS.get(proto)
     if not tag:
         return None
@@ -839,13 +741,11 @@ def _api_inbound_for(proto: str, clients: list) -> dict | None:
     if proto == "vless-xhttp":
         return {"tag": tag, "protocol": "vless", "port": CONFIG["xray_xhttp_port"],
                 "listen": "127.0.0.1", "settings": {"clients": clients, "decryption": "none"}}
-    # vless
+
     return {"tag": tag, "protocol": "vless", "port": CONFIG["xray_vless_port"],
             "listen": "127.0.0.1", "settings": {"clients": clients, "decryption": "none"}}
 
 def _inbound_active_user_count(proto: str, exclude_uid: str | None = None) -> int:
-    """تعداد کاربرهای فعالِ یک inbound (همین الان در کانفیگ در حال اجرا). برای تشخیص
-    «اولین کاربر» که اون موقع inbound هنوز وجود نداره و باید reload بشه."""
     n = 0
     for uid, link in LINKS.items():
         if exclude_uid is not None and uid == exclude_uid:
@@ -855,8 +755,6 @@ def _inbound_active_user_count(proto: str, exclude_uid: str | None = None) -> in
     return n
 
 async def xray_add_user(uid: str, link: dict) -> bool:
-    """کاربر رو روی همه‌ی inboundهای پروتکل‌هاش از طریق Xray API اضافه می‌کنه (بدون restart).
-    True یعنی همه‌ی پروتکل‌ها موفق اعمال شدن؛ False یعنی نیاز به reload کامل هست."""
     if not await detect_userapi_support():
         return False
     if not (xray_process and xray_process.returncode is None):
@@ -868,8 +766,7 @@ async def xray_add_user(uid: str, link: dict) -> bool:
         if not tag:
             ok_all = False
             continue
-        # اگه این اولین کاربرِ این inbound باشه، inbound هنوز در کانفیگِ در حال اجرا نیست
-        # (build_xray_config فقط inboundهایی رو می‌سازه که حداقل یک کلاینت دارن) → باید reload بشه.
+
         if _inbound_active_user_count(proto, exclude_uid=uid) == 0:
             ok_all = False
             continue
@@ -885,7 +782,7 @@ async def xray_add_user(uid: str, link: dict) -> bool:
             fpath.write_text(json.dumps({"inbounds": [inbound]}, ensure_ascii=False))
             rc, out = await _run_xray_api("adu", f"--server={server}", str(fpath))
             low = out.lower()
-            # «already exists» یعنی کاربر از قبل هست = موفقیت (idempotent)
+
             if rc != 0 and "already exists" not in low:
                 logger.warning(f"⚠️ adu برای {proto}/{uid[:8]} ناموفق: {out.strip()[:200]}")
                 ok_all = False
@@ -898,7 +795,6 @@ async def xray_add_user(uid: str, link: dict) -> bool:
     return ok_all
 
 async def xray_remove_user(uid: str, link: dict) -> bool:
-    """کاربر رو از همه‌ی inboundهای پروتکل‌هاش از طریق Xray API حذف می‌کنه (بدون restart)."""
     if not await detect_userapi_support():
         return False
     if not (xray_process and xray_process.returncode is None):
@@ -910,14 +806,13 @@ async def xray_remove_user(uid: str, link: dict) -> bool:
         if not tag:
             ok_all = False
             continue
-        # اگه inbound اصلاً وجود نداره (هیچ کاربر فعال دیگه‌ای نداره)، حذف بی‌معنیه و
-        # نیازی هم نیست؛ موفق در نظر می‌گیریم تا reload الکی نشه.
+
         if _inbound_active_user_count(proto, exclude_uid=uid) == 0:
             continue
         try:
             rc, out = await _run_xray_api("rmu", f"--server={server}", f"-tag={tag}", uid)
             low = out.lower()
-            # «not found» یعنی کاربر از قبل نبوده = همان نتیجه‌ی مطلوب
+
             if rc != 0 and "not found" not in low and "does not exist" not in low:
                 logger.warning(f"⚠️ rmu برای {proto}/{uid[:8]} ناموفق: {out.strip()[:200]}")
                 ok_all = False
@@ -927,7 +822,6 @@ async def xray_remove_user(uid: str, link: dict) -> bool:
     return ok_all
 
 async def apply_user_removals(uids: list[str], links_snapshot: dict) -> None:
-    """چند کاربر رو حذف می‌کنه؛ اگه برای هرکدوم API در دسترس نبود، یک‌بار reload کامل می‌زنه."""
     if not uids:
         return
     need_reload = False
@@ -940,7 +834,6 @@ async def apply_user_removals(uids: list[str], links_snapshot: dict) -> None:
     if need_reload:
         await reload_xray()
 
-# ───────── Persistence ─────────
 async def save_data():
     try:
         async with LINKS_LOCK:
@@ -981,7 +874,6 @@ def load_data():
         logger.error(f"Load error: {e}")
 
 async def ensure_reality_keys():
-    """اگه کلید Reality قبلاً ساخته نشده، یه‌بار با باینری xray می‌سازدش و persist می‌کنه."""
     if REALITY.get("private_key") and REALITY.get("public_key"):
         return
     try:
@@ -1008,8 +900,6 @@ async def ensure_reality_keys():
     except Exception as e:
         logger.warning(f"⚠️ ساخت کلید Reality شکست خورد: {e}")
 
-
-# ───────── Background loops ─────────
 async def keepalive_loop():
     await asyncio.sleep(60)
     while True:
@@ -1022,9 +912,6 @@ async def keepalive_loop():
         await asyncio.sleep(10 * 60)
 
 async def reset_link_usage(uid: str, usage: dict | None = None) -> bool:
-    """مصرف یک لینک را بدون ری‌استارت Xray صفر می‌کند.
-    با ترفند baseline منفی: used = baseline + usage_جاری = 0 و از همین لحظه دوباره می‌شمارد.
-    خروجی: آیا لینک (که به‌خاطر اتمام سهمیه خاموش بود) دوباره فعال شد؟ (نیاز به reload)."""
     if usage is None:
         usage = await query_xray_stats()
     cur = int(usage.get(uid, 0))
@@ -1042,9 +929,6 @@ async def reset_link_usage(uid: str, usage: dict | None = None) -> bool:
     return reactivated
 
 async def enforce_ip_limits():
-    """برای هر لینک با max_ips>0: اگر تعداد IPهای فعال (last_seen در ۱۰ دقیقه‌ی اخیر) از حد
-    مجاز بیشتر شد، IPهای تازه‌تر را بلاک می‌کند تا جلوی اشتراک‌گذاری بیش‌ازحد گرفته شود.
-    IPهای قدیمی‌تر (بر اساس first_seen) مجاز می‌مانند."""
     window = datetime.now() - timedelta(minutes=10)
     async with LINKS_LOCK:
         limits = {uid: int(l.get("max_ips") or 0) for uid, l in LINKS.items()}
@@ -1064,7 +948,7 @@ async def enforce_ip_limits():
                 except Exception:
                     pass
             if len(active) > mx:
-                active.sort(key=lambda t: t[1])      # قدیمی‌ترها اول
+                active.sort(key=lambda t: t[1])
                 for ip, _ in active[mx:]:
                     to_block.add(ip)
     if to_block:
@@ -1088,12 +972,11 @@ async def scheduler_loop():
                     changed_snapshot[uid] = dict(link)
         if changed:
             await save_data()
-            # حذف کاربرهای منقضی بدون ری‌استارت (در صورت عدم پشتیبانی، reload کامل)
+
             await apply_user_removals(changed_uids, changed_snapshot)
             for label in changed:
                 logger.warning(f"⏰ لینک '{label}' منقضی و غیرفعال شد.")
 
-        # ── ریست خودکار سهمیه‌ی دوره‌ای (reset_days) ──
         now_dt = datetime.now()
         due = []
         async with LINKS_LOCK:
@@ -1117,8 +1000,7 @@ async def scheduler_loop():
                     reactivated_uids.append(uid)
             await save_data()
             if reactivated_uids:
-                # لینک‌هایی که به‌خاطر اتمام سهمیه خاموش بودن دوباره فعال شدن →
-                # کاربرشون رو بدون ری‌استارت اضافه می‌کنیم (در صورت نیاز reload کامل).
+
                 need_reload = False
                 async with LINKS_LOCK:
                     snap = {u: dict(LINKS[u]) for u in reactivated_uids if u in LINKS}
@@ -1129,22 +1011,17 @@ async def scheduler_loop():
                     await reload_xray()
             logger.warning(f"🔄 ریست دوره‌ای سهمیه برای {len(due)} لینک انجام شد.")
 
-        # ── اعمال محدودیت تعداد IP هم‌زمان ──
         try:
             await enforce_ip_limits()
         except Exception as e:
             logger.warning(f"⚠️ enforce_ip_limits error: {e}")
 
-        # ── پاکسازی session های منقضی (جلوگیری از رشد بی‌رویه‌ی حافظه) ──
         now = time.time()
         async with SESSIONS_LOCK:
             expired = [tok for tok, exp in SESSIONS.items() if exp < now]
             for tok in expired:
                 SESSIONS.pop(tok, None)
 
-        # ── پاکسازی IPهای قدیمی کلاینت‌ها (تنها ساختار بدون سقف؛ مهار رشد رم/فایل دیتا) ──
-        # IPی که PRUNE_AFTER دیده نشده حذف می‌شه. لینک‌های حذف‌شده هم کل سطلشون دور ریخته می‌شه.
-        # (هیچ سقف تعدادی روی IPهای هر لینک گذاشته نمی‌شه — فقط مبنای زمانی.)
         PRUNE_AFTER = timedelta(days=3)
         ip_cutoff = datetime.now() - PRUNE_AFTER
         async with LINK_CLIENTS_LOCK:
@@ -1162,47 +1039,42 @@ async def scheduler_loop():
                         pass
 
 async def traffic_loop():
-    """مصرف واقعی هر لینک رو هر ۳۰ ثانیه از Xray می‌خونه تا نمودار «ترافیک امروز» سریع آپدیت بشه.
-    خود فراخوانی Xray API سبکه (یه pipe محلی)، پس این فاصله مشکلی برای CPU ایجاد نمی‌کنه؛
-    اما برای جلوگیری از I/O زیاد دیسک، ذخیره‌سازی همچنان فقط هر ~۵ دقیقه (هر ۱۰ دور) یا
-    وقتی سهمیه‌ای تموم بشه انجام می‌شه."""
     global _last_usage_snapshot
     await asyncio.sleep(20)
     poll_count = 0
-    idle_streak = 0          # تعداد دورهای پشت‌سرهم بدون ترافیک
-    BASE_SLEEP = 60          # فاصله‌ی پایه وقتی ترافیک فعاله
-    MAX_SLEEP  = 300         # حداکثر فاصله وقتی همه‌چی idleه (۵ دقیقه)
+    idle_streak = 0
+    BASE_SLEEP = 60
+    MAX_SLEEP  = 300
     while True:
         try:
-            # اگه اصلاً لینکی وجود نداره، اجرای subprocess (xray api statsquery)
-            # بی‌فایده‌ست — رد می‌کنیم تا روی پنل‌های خلوت CPU الکی مصرف نشه.
+
             if not LINKS:
                 idle_streak += 1
                 await asyncio.sleep(min(MAX_SLEEP, BASE_SLEEP * 2))
                 continue
             usage = await query_xray_stats()
             if usage:
-                # ── محاسبه‌ی دلتا نسبت به پول قبلی (usage از Xray API تجمعیه، نه افزایشی) ──
+
                 delta_total = 0
                 for uid, val in usage.items():
-                    prev = _last_usage_snapshot.get(uid, val)  # دفعه‌ی اول دلتا صفر در نظر گرفته میشه
+                    prev = _last_usage_snapshot.get(uid, val)
                     if val >= prev:
                         delta_total += val - prev
-                    # اگه val < prev یعنی Xray ری‌استارت شده و شمارنده‌ها صفر شدن؛ این پول رو نادیده می‌گیریم
+
                 _last_usage_snapshot = dict(usage)
-                # ترافیک فعال → سریع بمون؛ بی‌ترافیک → کم‌کم فاصله رو باز کن
+
                 idle_streak = 0 if delta_total > 0 else idle_streak + 1
                 if delta_total > 0:
                     hour_key = datetime.now().strftime("%Y-%m-%d-%H")
                     hourly_traffic[hour_key] += delta_total
                     stats["total_bytes"] += delta_total
-                    # تجمیع روزانه برای نمودار ۷ روزه + حذف روزهای قدیمی‌تر از ۸ روز
+
                     day_key = datetime.now().strftime("%Y-%m-%d")
                     daily_traffic[day_key] += delta_total
                     day_cutoff = (datetime.now() - timedelta(days=8)).strftime("%Y-%m-%d")
                     for k in [k for k in daily_traffic if k < day_cutoff]:
                         daily_traffic.pop(k, None)
-                    # حذف باکت‌های قدیمی‌تر از ۴۸ ساعت برای جلوگیری از رشد بی‌رویه‌ی حافظه/فایل
+
                     cutoff = datetime.now() - timedelta(hours=48)
                     old_keys = [k for k in hourly_traffic
                                 if k < cutoff.strftime("%Y-%m-%d-%H")]
@@ -1225,21 +1097,19 @@ async def traffic_loop():
                 if quota_hit or poll_count % 15 == 0:
                     await save_data()
                 if quota_hit:
-                    # حذف کاربرهای تمام‌سهمیه بدون ری‌استارت (در صورت عدم پشتیبانی، reload کامل)
+
                     await apply_user_removals(quota_hit_uids, quota_snapshot)
                     for label in quota_hit:
                         logger.warning(f"📊 سهمیه لینک '{label}' تمام شد و غیرفعال شد.")
         except Exception as e:
             logger.warning(f"⚠️ traffic loop error: {e}")
-        # backoff تطبیقی: بعد از ۳ دور بی‌ترافیک فاصله رو پله‌پله تا MAX_SLEEP باز می‌کنیم.
-        # به‌محض دیدن ترافیک، idle_streak صفر می‌شه و دوباره به BASE_SLEEP برمی‌گرده.
+
         if idle_streak >= 3:
             sleep_for = min(MAX_SLEEP, BASE_SLEEP * (1 + (idle_streak - 2)))
         else:
             sleep_for = BASE_SLEEP
         await asyncio.sleep(sleep_for)
 
-# ───────── Link generation helpers ─────────
 def generate_vless_link(uid: str, host: str, label: str = "tryak") -> str:
     path = "/xray-ws"
     params = {
@@ -1253,7 +1123,6 @@ def generate_trojan_link(password: str, host: str, label: str = "tryak") -> str:
     params = {"security": "tls", "type": "ws", "path": "/xray-trojan", "sni": host}
     q = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
     return f"trojan://{quote(password)}@{host}:443?{q}#{quote(label)}"
-
 
 def generate_vless_xhttp_link(uid: str, host: str, label: str = "tryak") -> str:
     path = "/xray-xhttp"
@@ -1308,7 +1177,6 @@ def get_connection_for_protocol(uid: str, link: dict, proto: str, host: str, ind
     return {}
 
 def get_link_connections(uid: str, link: dict, host: str) -> list:
-    """برای همه‌ی پروتکل‌های انتخاب‌شده روی یک لینک (همون uid)، اطلاعات اتصال جدا برمی‌گردونه."""
     conns = []
     for proto in link_protocols(link):
         c = get_connection_for_protocol(uid, link, proto, host, 0)
@@ -1318,13 +1186,11 @@ def get_link_connections(uid: str, link: dict, host: str) -> list:
     return conns
 
 def get_link_connection_info(uid: str, link: dict, host: str, index: int = 0) -> dict:
-    """سازگاری روبه‌عقب: اولین اتصال (پروتکل اصلی) لینک رو برمی‌گردونه."""
     protos = link_protocols(link)
     if not protos:
         return {}
     return get_connection_for_protocol(uid, link, protos[0], host, index)
 
-# ───────── Lifespan ─────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global http_client, keepalive_task, scheduler_task, traffic_task
@@ -1334,8 +1200,8 @@ async def lifespan(app: FastAPI):
 
     load_data()
     await ensure_reality_keys()
-    await start_xray()   # لاگ Xray خاموشه؛ دیگه stdout reader استارت نمی‌شه
-    # تشخیص پشتیبانی adu/rmu (افزودن/حذف کاربر بدون ری‌استارت) — یک‌بار، غیرمسدودکننده
+    await start_xray()
+
     asyncio.create_task(detect_userapi_support())
 
     keepalive_task   = asyncio.create_task(keepalive_loop())
@@ -1353,11 +1219,7 @@ async def lifespan(app: FastAPI):
         await http_client.aclose()
 
 app = FastAPI(title="tryak Xray Gateway", docs_url=None, redoc_url=None, lifespan=lifespan)
-# ───── CORS ─────
-# origin=["*"] همراه allow_credentials=True هم نامعتبر است و هم خطرناک.
-# داشبورد فقط از روی همان دامنه‌ی عمومی سرویس استفاده می‌شود، پس origin را
-# به همان دامنه محدود می‌کنیم. در صورت نیاز می‌توان با env چند origin اضافه کرد:
-#   CORS_ORIGINS="https://a.example.com,https://b.example.com"
+
 def _build_cors_origins() -> list[str]:
     extra = [o.strip() for o in os.environ.get("CORS_ORIGINS", "").split(",") if o.strip()]
     host = _detect_host()
@@ -1365,9 +1227,9 @@ def _build_cors_origins() -> list[str]:
     if host and host != "localhost":
         auto = [f"https://{host}", f"http://{host}"]
     else:
-        # محیط توسعه‌ی محلی
+
         auto = ["http://localhost:8000", "http://127.0.0.1:8000"]
-    # حذف تکراری‌ها با حفظ ترتیب
+
     return list(dict.fromkeys(extra + auto))
 
 app.add_middleware(
@@ -1376,7 +1238,6 @@ app.add_middleware(
     allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
-# ───────── Basic Endpoints ─────────
 @app.get("/")
 async def root():
     return {"service": "tryak Xray Gateway", "version": "1.0", "status": "active", "host": _detect_host()}
@@ -1386,7 +1247,6 @@ async def health():
     x = xray_status()
     return {"status": "ok", "uptime": uptime(), "xray_running": x["running"], "xray_pid": x["pid"]}
 
-# ───────── Auth ─────────
 @app.post("/api/login")
 async def api_login(request: Request):
     body = await request.json()
@@ -1395,8 +1255,7 @@ async def api_login(request: Request):
         raise HTTPException(status_code=401, detail="رمز عبور اشتباه است")
     token = await create_session()
     resp = JSONResponse({"ok": True})
-    # secure=True تا کوکی نشست فقط روی HTTPS ارسال شود (اتصال عمومی Railway روی TLS است).
-    # برای تست محلی روی HTTP می‌توان COOKIE_SECURE=0 گذاشت.
+
     cookie_secure = os.environ.get("COOKIE_SECURE", "1").strip().lower() not in ("0", "false", "no")
     resp.set_cookie(key=SESSION_COOKIE, value=token, max_age=SESSION_TTL,
                     httponly=True, secure=cookie_secure, samesite="lax", path="/")
@@ -1414,7 +1273,6 @@ async def api_me(request: Request):
     valid = await is_valid_session(request.cookies.get(SESSION_COOKIE))
     return {"authenticated": valid}
 
-# ───────── Stats ─────────
 @app.get("/stats")
 async def get_stats(_=Depends(require_auth)):
     x = xray_status()
@@ -1437,8 +1295,6 @@ async def get_stats(_=Depends(require_auth)):
 
 @app.get("/api/traffic/today")
 async def get_traffic_today(_=Depends(require_auth)):
-    """ترافیک امروز (از ساعت ۰۰:۰۰ تا الان) به تفکیک ساعت، برای رسم نمودار.
-    خروجی همیشه ۲۴ نقطه (ساعت ۰ تا ۲۳) داره؛ ساعت‌های آینده/بدون داده مقدار صفر دارن."""
     today = datetime.now().strftime("%Y-%m-%d")
     points = []
     total_today = 0
@@ -1451,7 +1307,6 @@ async def get_traffic_today(_=Depends(require_auth)):
 
 @app.get("/api/traffic/week")
 async def get_traffic_week(_=Depends(require_auth)):
-    """ترافیک ۷ روز اخیر به تفکیک روز، برای رسم نمودار هفتگی."""
     points = []
     total = 0
     for i in range(6, -1, -1):
@@ -1461,11 +1316,9 @@ async def get_traffic_week(_=Depends(require_auth)):
         points.append({"date": d, "label": d[5:], "bytes": val})
     return {"points": points, "total_bytes": total}
 
-# ───────── Link Management ─────────
 def _new_link_dict(label: str, protocols: list, limit_bytes: int, expires_at: str | None,
                    password: str, ss_method: str, reset_days: int, max_ips: int,
                    tags: list, note: str) -> dict:
-    """دیکشنری یک لینک تازه با مصرف صفر — مشترک بین ساخت تکی/گروهی/کلون."""
     now = datetime.now().isoformat()
     return {
         "label":          label,
@@ -1491,12 +1344,11 @@ async def create_link(request: Request, _=Depends(require_auth)):
     body = await request.json()
     label = (body.get("label") or "لینک جدید").strip()[:60]
 
-    # سازگار با فرانت قدیمی (یک پروتکل) و جدید (چند پروتکل هم‌زمان روی همون uuid)
     protocols = body.get("protocols")
     if not isinstance(protocols, list) or not protocols:
         single = body.get("protocol", "vless")
         protocols = [single]
-    protocols = list(dict.fromkeys(protocols))  # حذف تکراری، حفظ ترتیب
+    protocols = list(dict.fromkeys(protocols))
     for p in protocols:
         if p not in SUPPORTED_PROTOCOLS:
             raise HTTPException(400, f"پروتکل نامعتبر: {p}. مجاز: {SUPPORTED_PROTOCOLS}")
@@ -1507,16 +1359,16 @@ async def create_link(request: Request, _=Depends(require_auth)):
     password     = body.get("password") or secrets.token_urlsafe(16)
     ss_method    = body.get("ss_method") or "aes-256-gcm"
 
-    reset_days   = int(float(body.get("reset_days") or 0))     # ریست خودکار سهمیه هر N روز (۰=غیرفعال)
-    max_ips      = int(float(body.get("max_ips") or 0))        # حداکثر IP هم‌زمان (۰=نامحدود)
+    reset_days   = int(float(body.get("reset_days") or 0))
+    max_ips      = int(float(body.get("max_ips") or 0))
 
     limit_bytes  = 0 if limit_value <= 0 else parse_size_to_bytes(limit_value, limit_unit)
     expires_at   = (datetime.now() + timedelta(days=expire_days)).isoformat() if expire_days > 0 else None
-    uid          = str(_uuid_mod.uuid4())  # همیشه uuid4 تازه
+    uid          = str(_uuid_mod.uuid4())
 
     new_link = {
         "label":       label,
-        "protocol":    protocols[0],   # سازگاری روبه‌عقب
+        "protocol":    protocols[0],
         "protocols":   protocols,
         "limit_bytes": limit_bytes,
         "used_bytes":  0,
@@ -1535,12 +1387,6 @@ async def create_link(request: Request, _=Depends(require_auth)):
     async with LINKS_LOCK:
         LINKS[uid] = new_link
 
-    # نکته‌ی مهم: قبلاً اینجا reload_xray() (که خود Xray رو ری‌استارت می‌کنه و چند ثانیه طول
-    # می‌کشه) await می‌شد و کلاینت تا اون موقع منتظر می‌ماند. این باعث می‌شد کاربر فکر کنه
-    # درخواست گیر کرده، دکمه رو دوباره بزنه یا صفحه رو رفرش کنه و همون لینک دوبار ساخته شه.
-    # حالا ابتدا داده ذخیره و پاسخ فوراً برگردونده می‌شه.
-    # سپس سعی می‌کنیم کاربر رو بدون ری‌استارت اضافه کنیم (adu)؛ اگه نشد (مثلاً اولین کاربرِ
-    # یک inbound یا باینری قدیمی)، در پس‌زمینه reload کامل می‌زنیم.
     await save_data()
     async def _apply_create():
         if not await xray_add_user(uid, new_link):
@@ -1628,7 +1474,7 @@ async def update_link(uid: str, request: Request, _=Depends(require_auth)):
         if uid not in LINKS:
             raise HTTPException(404, "link not found")
         link = LINKS[uid]
-        # وضعیت قبلی برای تصمیم‌گیری درباره‌ی نحوه‌ی اعمال در Xray
+
         old_active   = bool(link.get("active"))
         old_protos   = set(link_protocols(link))
         old_password = link.get("password")
@@ -1654,7 +1500,7 @@ async def update_link(uid: str, request: Request, _=Depends(require_auth)):
             link["expires_at"] = (datetime.now() + timedelta(days=ed)).isoformat() if ed > 0 else None
         if "password"     in body: link["password"]  = str(body["password"])
         if "ss_method"    in body: link["ss_method"] = str(body["ss_method"])
-        # برچسب/یادداشت (جستجو و دسته‌بندی)
+
         if "tags" in body:
             link["tags"] = _normalize_tags(body.get("tags"))
         if "note" in body:
@@ -1664,7 +1510,6 @@ async def update_link(uid: str, request: Request, _=Depends(require_auth)):
         new_password = link.get("password")
         link_copy    = dict(link)
 
-    # ریست مصرف خارج از قفل و با روش درست (baseline منفی) انجام می‌شه تا واقعاً صفر شه
     reactivated = False
     if do_reset:
         reactivated = await reset_link_usage(uid)
@@ -1673,11 +1518,6 @@ async def update_link(uid: str, request: Request, _=Depends(require_auth)):
 
     await save_data()
 
-    # تصمیم درباره‌ی نحوه‌ی اعمال در Xray:
-    #  • تغییر پروتکل‌ها یا رمز Trojan ساختار inbound رو عوض می‌کنه → reload کامل.
-    #  • فقط فعال/غیرفعال شدن → افزودن/حذف کاربر بدون ری‌استارت (adu/rmu).
-    #  • تغییر حجم/مدت/ریست/max_ips/برچسب/یادداشت اصلاً روی کانفیگ Xray اثر نداره →
-    #    هیچ ری‌استارتی لازم نیست (بهبود بزرگ کارایی: قبلاً هر تغییر کوچیک reload می‌کرد).
     struct_changed = (new_protos != old_protos) or (new_password != old_password)
     async def _apply_update():
         if struct_changed:
@@ -1698,18 +1538,15 @@ async def delete_link(uid: str, _=Depends(require_auth)):
     async with LINK_CLIENTS_LOCK:
         link_clients.pop(uid, None)
     await save_data()
-    # تلاش برای حذف بدون ری‌استارت (rmu)؛ در صورت عدم پشتیبانی، reload کامل.
+
     async def _apply_delete():
         if not (removed_link and await xray_remove_user(uid, removed_link)):
             await reload_xray()
     asyncio.create_task(_apply_delete())
     return {"ok": True}
 
-# ───────── کلون لینک (با یک کلیک) ─────────
 @app.post("/api/links/{uid}/clone")
 async def clone_link(uid: str, request: Request, _=Depends(require_auth)):
-    """یک کپی از لینک می‌سازه: همون تنظیمات (پروتکل/حجم/مدت/IP/برچسب) ولی با
-    uuid و رمز تازه و مصرف صفر."""
     try:
         body = await request.json()
     except Exception:
@@ -1722,7 +1559,7 @@ async def clone_link(uid: str, request: Request, _=Depends(require_auth)):
     protocols = link_protocols(src)
     new_uid   = str(_uuid_mod.uuid4())
     new_label = (str(body.get("label") or "").strip() or f"{src.get('label', 'لینک')} (کپی)")[:60]
-    # رمز Trojan باید یکتا باشه وگرنه با لینک اصلی تداخل می‌کنه → رمز تازه می‌سازیم
+
     new_link = _new_link_dict(
         label=new_label, protocols=protocols,
         limit_bytes=int(src.get("limit_bytes", 0) or 0),
@@ -1749,7 +1586,6 @@ async def clone_link(uid: str, request: Request, _=Depends(require_auth)):
             "tags": new_link["tags"], "note": new_link["note"],
             "connection": conns[0] if conns else {}, "connections": conns}
 
-# ───────── ساخت گروهی N لینک یک‌جا ─────────
 @app.post("/api/links/bulk")
 async def bulk_create_links(request: Request, _=Depends(require_auth)):
     body = await request.json()
@@ -1787,11 +1623,10 @@ async def bulk_create_links(request: Request, _=Depends(require_auth)):
             LINKS[new_uid] = nl
             created.append({"uuid": new_uid, "label": nl["label"]})
     await save_data()
-    # برای چند لینک، یک reload واحد ساده‌تر و کم‌هزینه‌تر از N فراخوانی adu است.
+
     asyncio.create_task(reload_xray())
     return {"ok": True, "created": len(created), "links": created}
 
-# ───────── عملیات گروهی: حذف/تمدید/فعال/غیرفعال/ریست دسته‌ای ─────────
 @app.post("/api/links/bulk-action")
 async def bulk_action_links(request: Request, _=Depends(require_auth)):
     body   = await request.json()
@@ -1836,10 +1671,9 @@ async def bulk_action_links(request: Request, _=Depends(require_auth)):
             affected += 1
 
     await save_data()
-    asyncio.create_task(reload_xray())   # یک reload واحد برای کل دسته
+    asyncio.create_task(reload_xray())
     return {"ok": True, "action": action, "affected": affected}
 
-# ───────── Xray Control ─────────
 @app.post("/api/xray/restart")
 async def xray_restart(_=Depends(require_auth)):
     await reload_xray()
@@ -1854,17 +1688,14 @@ async def xray_config(_=Depends(require_auth)):
 @app.get("/api/xray/status")
 async def get_xray_status(_=Depends(require_auth)):
     st = xray_status()
-    st["userapi"] = _userapi_supported   # adu/rmu فعاله یا نه (None=هنوز تشخیص داده نشده)
+    st["userapi"] = _userapi_supported
     return st
 
-# ───────── Reality settings (dest / SNI از داخل پنل) ─────────
 _HOSTPORT_RE = re.compile(r"^[A-Za-z0-9.\-]+(?::\d{1,5})?$")
 _HOST_RE     = re.compile(r"^[A-Za-z0-9.\-]+$")
 
 @app.get("/api/reality")
 async def get_reality(_=Depends(require_auth)):
-    """تنظیمات فعلی Reality. effective_* مقداری است که واقعاً در کانفیگ به‌کار می‌رود
-    (پنل ← env ← پیش‌فرض)؛ مقادیر env هم برای نمایش برگردانده می‌شوند."""
     return {
         "dest":           REALITY.get("dest", ""),
         "sni":            REALITY.get("sni", ""),
@@ -1879,14 +1710,12 @@ async def get_reality(_=Depends(require_auth)):
 
 @app.post("/api/reality")
 async def set_reality(request: Request, _=Depends(require_auth)):
-    """dest و/یا SNI را از پنل تنظیم می‌کند. مقدار خالی یعنی «به پیش‌فرض env برگرد».
-    بعد از ذخیره، Xray در پس‌زمینه ری‌لود می‌شود تا تغییر اعمال شود."""
     body = await request.json()
     dest = str(body.get("dest", "")).strip()
     sni  = str(body.get("sni", "")).strip()
 
     if dest:
-        # اگر پورت ذکر نشده باشد، :443 اضافه می‌کنیم (پیش‌فرض TLS)
+
         if ":" not in dest:
             dest = f"{dest}:443"
         if not _HOSTPORT_RE.match(dest):
@@ -1897,22 +1726,20 @@ async def set_reality(request: Request, _=Depends(require_auth)):
     if sni and not _HOST_RE.match(sni):
         raise HTTPException(400, "SNI نامعتبر است. فقط دامنه مجاز است، نمونه: www.microsoft.com")
 
-    # اگر SNI خالی بماند ولی dest ست شده باشد، SNI را خودکار از هاستِ dest می‌گیریم
     if dest and not sni:
         sni = dest.split(":")[0]
 
     async with LINKS_LOCK:
-        REALITY["dest"] = dest          # خالی = برگشت به env
+        REALITY["dest"] = dest
         REALITY["sni"]  = sni
     await save_data()
-    asyncio.create_task(reload_xray())  # غیرمسدودکننده؛ اتصال‌های فعلی موقتاً قطع و دوباره وصل می‌شوند
+    asyncio.create_task(reload_xray())
     return {
         "ok": True,
         "effective_dest": reality_dest(),
         "effective_sni":  reality_sni(),
     }
 
-# ───────── Blocked IPs ─────────
 @app.get("/api/blocked")
 async def get_blocked(_=Depends(require_auth)):
     return {"blocked_ips": list(BLOCKED_IPS)}
@@ -1924,20 +1751,18 @@ async def block_ip(request: Request, _=Depends(require_auth)):
     if not ip: raise HTTPException(400, "IP required")
     BLOCKED_IPS.add(ip)
     await save_data()
-    asyncio.create_task(reload_xray())   # تا بلاک واقعاً در Xray اعمال بشه
+    asyncio.create_task(reload_xray())
     return {"ok": True}
 
 @app.delete("/api/blocked/{ip}")
 async def unblock_ip(ip: str, _=Depends(require_auth)):
     BLOCKED_IPS.discard(ip)
     await save_data()
-    asyncio.create_task(reload_xray())   # آنبلاک هم باید در Xray اعمال بشه
+    asyncio.create_task(reload_xray())
     return {"ok": True}
 
-# ───────── Export / Import (پشتیبان‌گیری) ─────────
 @app.get("/api/export")
 async def export_data(_=Depends(require_auth)):
-    """کل کانفیگ (لینک‌ها، بلاک‌ها، کلیدهای Reality، تاریخچه) را به‌صورت JSON برمی‌گرداند."""
     async with LINKS_LOCK:
         data = {
             "links":       {k: dict(v) for k, v in LINKS.items()},
@@ -1958,7 +1783,6 @@ async def export_data(_=Depends(require_auth)):
 
 @app.post("/api/import")
 async def import_data(request: Request, _=Depends(require_auth)):
-    """کانفیگ را از یک فایل پشتیبان جایگزین می‌کند (لینک‌ها/بلاک‌ها/تاریخچه)."""
     try:
         data = await request.json()
     except Exception:
@@ -1985,11 +1809,7 @@ async def import_data(request: Request, _=Depends(require_auth)):
     asyncio.create_task(reload_xray())
     return {"ok": True, "links": len(LINKS)}
 
-# ───────── Subscription helpers (هدر Userinfo + فرمت‌های Clash / sing-box) ─────────
 def _sub_userinfo_headers(link: dict) -> dict:
-    """هدر استاندارد Subscription-Userinfo که کلاینت‌هایی مثل v2rayNG / NekoBox /
-    Streisand مصرف، سهمیه و تاریخ انقضا رو مستقیم داخل اپ نشون می‌دن.
-    قالب: upload=..; download=..; total=..; expire=<unix>  (total=0 یعنی نامحدود)."""
     used  = int(link.get("used_bytes", 0) or 0)
     total = int(link.get("limit_bytes", 0) or 0)
     parts = ["upload=0", f"download={used}", f"total={total}"]
@@ -2001,7 +1821,7 @@ def _sub_userinfo_headers(link: dict) -> dict:
             pass
     h = {
         "Subscription-Userinfo":   "; ".join(parts),
-        "Profile-Update-Interval": "12",          # ساعت
+        "Profile-Update-Interval": "12",
     }
     label = link.get("label")
     if label:
@@ -2019,8 +1839,6 @@ def is_vpn_ua(ua: str) -> bool:
     return any(m in ua for m in _VPN_UA_MARKERS)
 
 def _detect_sub_format(request: Request) -> str:
-    """فرمت خروجی ساب رو تشخیص می‌ده: clash | singbox | base64.
-    اولویت با پارامتر ?format= است، بعد User-Agent."""
     fmt = (request.query_params.get("format") or "").lower().strip()
     if fmt in ("clash", "clashmeta", "clash-meta", "meta"):
         return "clash"
@@ -2036,13 +1854,9 @@ def _detect_sub_format(request: Request) -> str:
     return "base64"
 
 def _yaml_q(s) -> str:
-    """رشته رو برای YAML امن نقل‌قول می‌کنه."""
     return '"' + str(s).replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 def build_clash_yaml(uid: str, link: dict, host: str) -> str:
-    """کانفیگ کامل و قابل‌استفاده‌ی Clash Meta (mihomo). فقط پروتکل‌های قابل پشتیبانی
-    (VLESS+WS، Trojan+WS، VLESS+Reality) خروجی داده می‌شن؛ XHTTP که در کلاینت‌های Clash
-    پشتیبانی فراگیر نداره نادیده گرفته می‌شه."""
     label = link.get("label", "tryak")
     proxies, names = [], []
     for proto in link_protocols(link):
@@ -2107,8 +1921,6 @@ def build_clash_yaml(uid: str, link: dict, host: str) -> str:
     return "\n".join(out) + "\n"
 
 def build_singbox_json(uid: str, link: dict, host: str) -> str:
-    """کانفیگ قابل‌استفاده‌ی sing-box با inbound mixed + dns + route. فقط
-    VLESS+WS، Trojan+WS و VLESS+Reality خروجی داده می‌شن."""
     label = link.get("label", "tryak")
     outs, tags = [], []
     for proto in link_protocols(link):
@@ -2157,8 +1969,6 @@ def build_singbox_json(uid: str, link: dict, host: str) -> str:
     return json.dumps(config, ensure_ascii=False, indent=2)
 
 def make_subscription_response(uid: str, link: dict, request: Request) -> Response:
-    """خروجی ساب رو بر اساس فرمت درخواستی (clash/singbox/base64) می‌سازه و همیشه
-    هدر Subscription-Userinfo (مصرف/سهمیه/انقضا) رو ضمیمه می‌کنه."""
     host    = _detect_host()
     fmt     = _detect_sub_format(request)
     headers = _sub_userinfo_headers(link)
@@ -2170,34 +1980,25 @@ def make_subscription_response(uid: str, link: dict, request: Request) -> Respon
         headers["Content-Disposition"] = f'attachment; filename="{uid[:8]}.json"'
         return Response(content=build_singbox_json(uid, link, host),
                         media_type="application/json; charset=utf-8", headers=headers)
-    # base64 استاندارد (v2rayNG / NekoBox / Streisand ...)
+
     conns = get_link_connections(uid, link, host)
     importable = [c["link"] for c in conns if c.get("link", "").startswith(("vless://", "trojan://"))]
     encoded = base64.b64encode("\n".join(importable).encode()).decode()
     return Response(content=encoded, media_type="text/plain; charset=utf-8", headers=headers)
 
-# ───────── Subscription Page ─────────
 @app.get("/sub/{uid}/raw", response_class=Response)
 async def subscription_raw(uid: str, request: Request):
-    """لینک سابسکریپشن استاندارد (Base64) برای وارد کردن مستقیم در کلاینت‌هایی مثل
-    v2rayNG / v2rayN / NekoBox / Streisand و غیره. خروجی متن ساده‌ست: هر خط یک
-    لینک (vless:// trojan:// ss://...)، که کل متن با Base64 استاندارد انکود شده.
-    HTTP Proxy در این لیست نمیاد چون فرمت قابل‌import در کلاینت‌های VPN نیست.
-    با پارامتر ?format=clash یا ?format=singbox می‌شه خروجی Clash Meta یا sing-box گرفت."""
     async with LINKS_LOCK:
         link = LINKS.get(uid)
     if not link:
         raise HTTPException(404, "لینک یافت نشد")
     return make_subscription_response(uid, link, request)
 
-
 @app.get("/sub/{uid}")
 async def subscription_page(uid: str, request: Request):
-    # کلاینت‌های VPN (v2rayNG، Nekobox، ویتوری، clash و ...) با User-Agent شناسایی میشن
-    # و برای اونا مستقیم raw برمیگردونیم؛ مرورگر انسانی HTML زیبا می‌بینه
+
     ua = request.headers.get("user-agent", "").lower()
-    # کلاینت VPN یا درخواست با ?format= → خروجی ساب (base64/clash/singbox) به‌همراه
-    # هدر Subscription-Userinfo؛ مرورگر انسانی → صفحه‌ی HTML زیبا.
+
     if is_vpn_ua(ua) or not ua or request.query_params.get("format"):
         async with LINKS_LOCK:
             link_check = LINKS.get(uid)
@@ -2263,7 +2064,6 @@ async def subscription_page(uid: str, request: Request):
     else:
         time_remaining_html = "♾️ نامحدود"
 
-    # نام کوتاه و خوانا برای هر کانفیگ (به‌جای نمایش کامل لینک)
     _short_proto_names = {
         "vless":         "VLESS · WS",
         "trojan":        "Trojan · WS",
@@ -2285,7 +2085,6 @@ async def subscription_page(uid: str, request: Request):
 
     conn_links_js = ",".join(json.dumps(c.get("link", "")) for c in conns)
 
-    # لینک ساب raw (استاندارد base64) برای کپی مستقیم در کلاینت‌ها
     sub_link_url = f"https://{host}/sub/{uid}/raw"
 
     html = f"""<!DOCTYPE html>
@@ -2515,7 +2314,6 @@ function copyAllConfigs(){{
 </html>"""
     return HTMLResponse(content=html)
 
-# ───────── Login Page ─────────
 LOGIN_HTML = r"""<!DOCTYPE html>
 <html lang="fa" dir="rtl">
 <head>
@@ -2605,7 +2403,6 @@ async def login_page(request: Request):
         return RedirectResponse("/dashboard")
     return HTMLResponse(content=LOGIN_HTML)
 
-# ───────── Dashboard ─────────
 DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="fa" dir="rtl">
 <head>
