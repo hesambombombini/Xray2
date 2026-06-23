@@ -1,8 +1,12 @@
-FROM python:3.11-slim
+# ═══════════════════════════════════════════════════════════════
+# پروژه فقط و فقط برای Railway بهینه شده است.
+# Stage 1: Builder — دانلود Xray + build کردن wheelها
+# (curl/unzip فقط در همین stage هستند و وارد image نهایی نمی‌شن)
+# ═══════════════════════════════════════════════════════════════
+FROM python:3.11-slim AS builder
 
-# ───── ابزارهای پایه ─────
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl unzip ca-certificates nginx gettext-base \
+    curl unzip ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # ───── Xray-core ─────
@@ -14,29 +18,35 @@ RUN echo "Installing Xray ${XRAY_VERSION}" \
         -o /tmp/xray.zip \
     && unzip -q /tmp/xray.zip -d /tmp/xray \
     && mv /tmp/xray/xray /usr/local/bin/xray \
-    && chmod +x /usr/local/bin/xray \
-    && rm -rf /tmp/xray /tmp/xray.zip
+    && chmod +x /usr/local/bin/xray
 
-# ───── GeoIP (با چند fallback مطمئن) ─────
-# geosite.dat لازم نیست — routing فقط از geoip:private/geoip:cn استفاده می‌کنه
-RUN mkdir -p /usr/local/share/xray \
-    && (curl -fL --retry 3 --retry-delay 2 \
-        https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat \
-        -o /usr/local/share/xray/geoip.dat 2>/dev/null \
-     || curl -fL --retry 3 --retry-delay 2 \
-        https://github.com/v2fly/geoip/releases/latest/download/geoip.dat \
-        -o /usr/local/share/xray/geoip.dat 2>/dev/null \
-     || echo "⚠️ geoip.dat دانلود نشد — routing مبتنی بر geoip غیرفعال خواهد بود") \
-    && apt-get purge -y unzip && apt-get autoremove -y \
-    && rm -rf /var/lib/apt/lists/* /tmp/*
+# ───── Python wheels (در همین stage build می‌شن) ─────
+WORKDIR /app
+COPY requirements.txt .
+RUN pip wheel --no-cache-dir --wheel-dir /wheels -r requirements.txt
+
+# ═══════════════════════════════════════════════════════════════
+# Stage 2: Runtime — image سبک نهایی (بدون curl/unzip/gettext)
+# ═══════════════════════════════════════════════════════════════
+FROM python:3.11-slim
+
+# فقط ابزارهای لازم زمان اجرا (envsubst حذف شد — رندر nginx با sed انجام می‌شه)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    nginx ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# ───── باینری Xray از builder ─────
+COPY --from=builder /usr/local/bin/xray /usr/local/bin/xray
 
 # ───── Nginx config ─────
 COPY nginx.conf /etc/nginx/nginx.conf
 
-# ───── Python deps ─────
+# ───── Python deps (از wheelهای از پیش build شده) ─────
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY --from=builder /wheels /wheels
+RUN pip install --no-cache-dir --no-index --find-links=/wheels -r requirements.txt \
+    && rm -rf /wheels
 
 # ───── App ─────
 COPY main_xray.py .
@@ -45,8 +55,8 @@ RUN chmod +x /entrypoint.sh
 
 # ───── ENV defaults ─────
 ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
     PYTHONOPTIMIZE=1 \
-    XRAY_LOCATION_ASSET=/usr/local/share/xray \
     XRAY_BIN=/usr/local/bin/xray \
     DATA_DIR=/data
 
