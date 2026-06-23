@@ -54,11 +54,17 @@ COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 # ───── ENV defaults ─────
+# GOGC/GOMEMLIMIT: مهار حافظه‌ی پروسه‌ی Xray (Go). GC زودتر و مکررتر جمع می‌کنه
+#   و سقف نرم حافظه می‌ذاره. GOMEMLIMIT رو بسته به پلن Railway و تعداد کاربر تنظیم کن (60–120MiB).
+# MALLOC_ARENA_MAX=2: جلوگیری از رشد RSS پایتون/glibc (هر thread arena جدا نسازه)
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONOPTIMIZE=1 \
     XRAY_BIN=/usr/local/bin/xray \
-    DATA_DIR=/data
+    DATA_DIR=/data \
+    GOGC=20 \
+    GOMEMLIMIT=80MiB \
+    MALLOC_ARENA_MAX=2
 
 EXPOSE 8080
 

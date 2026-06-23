@@ -634,12 +634,11 @@ def build_xray_config() -> dict:
 
     return {
         "log": {
-            # نکته‌ی مهم: لاگ "accepted ... email: <uid>" که برای ردیابی IP کلاینت‌ها لازمه
-            # توی Xray با سطح severity = Info نوشته می‌شه؛ پس loglevel باید info باشه.
-            # "access" رو عمداً ست نمی‌کنیم (یا می‌ذاریمش خالی) تا Xray اون رو روی
-            # stdout بنویسه، نه روی یه فایل جدا روی دیسک — برنامه مستقیم از stdout
-            # خود پروسه می‌خونتش (xray_stdout_reader)، پس هیچ I/O دیسکی برای لاگ نداریم.
-            "loglevel": "warning",
+            # لاگ کامل خاموش است (نیازی به لاگ نداریم). دیگه stdout هم خونده نمی‌شه،
+            # پس نه I/O دیسک داریم، نه پردازش regex per-connection، نه task اضافه.
+            # ⚠️ با loglevel=none ردیابی خودکار IP/کشورِ کلاینت‌ها غیرفعال می‌شه؛
+            #    اگه روزی اون فیچر رو خواستی، این رو "info" کن و stdout reader رو برگردون.
+            "loglevel": "none",
             "access": "",
         },
         "api": {
@@ -708,12 +707,13 @@ async def start_xray():
         _xray_stdout_task.cancel()
         _xray_stdout_task = None
 
+    # لاگ Xray کاملاً خاموشه (loglevel=none)، پس stdout/stderr رو مستقیم دور می‌ریزیم
+    # و دیگه task خواننده‌ی stdout نمی‌سازیم — صرفه‌جویی در RAM/CPU.
     xray_process = await asyncio.create_subprocess_exec(
         str(XRAY_BIN), "run", "-c", str(_XRAY_CONFIG_PATH),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
     )
-    _xray_stdout_task = asyncio.create_task(xray_stdout_reader(xray_process))
 
 async def query_xray_stats() -> dict:
     """مصرف هر کاربر را از Xray API می‌خونه (بدون نیاز به وابستگی جدید، با باینری خود xray)."""
@@ -1334,7 +1334,7 @@ async def lifespan(app: FastAPI):
 
     load_data()
     await ensure_reality_keys()
-    await start_xray()   # خودش xray_stdout_reader رو هم استارت می‌کنه
+    await start_xray()   # لاگ Xray خاموشه؛ دیگه stdout reader استارت نمی‌شه
     # تشخیص پشتیبانی adu/rmu (افزودن/حذف کاربر بدون ری‌استارت) — یک‌بار، غیرمسدودکننده
     asyncio.create_task(detect_userapi_support())
 
